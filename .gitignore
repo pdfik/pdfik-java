@@ -1,0 +1,8 @@
+target/
+.gradle/
+build/
+*.class
+*.asc
+settings.xml
+deploy.sh
+gpg_batch.txt
