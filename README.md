@@ -1,11 +1,11 @@
 # pdfik-client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-08-07).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-08-17).
 > Releases to Maven Central are cut from the monorepo; issues and PRs are welcome here.
 
-Official Java SDK for [PDFik](https://pdfik.net) — the premium, fast, and reliable PDF generation API.
+Official Java SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
 
-Convert HTML markup or any public URL into pixel-perfect PDF documents in seconds, powered by scalable browser rendering.
+Submit a public URL or raw HTML, get a job id back, and receive an HMAC-signed webhook (or poll) when the PDF is ready. Rendering runs on sandboxed headless Chromium, so modern CSS, web fonts and JavaScript-heavy pages come out the way they look in the browser.
 
 ## Features
 
