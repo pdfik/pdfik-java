@@ -1,6 +1,6 @@
 # pdfik-client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-08-17).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-09-06).
 > Releases to Maven Central are cut from the monorepo; issues and PRs are welcome here.
 
 Official Java SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
@@ -25,7 +25,7 @@ Add the following dependency to your `pom.xml`:
 <dependency>
   <groupId>net.pdfik</groupId>
   <artifactId>pdfik-client</artifactId>
-  <version>0.1.5</version>
+  <version>0.2.0</version>
 </dependency>
 ```
 
@@ -34,7 +34,7 @@ Add the following dependency to your `pom.xml`:
 Add the following to your `build.gradle`:
 
 ```groovy
-implementation 'net.pdfik:pdfik-client:0.1.5'
+implementation 'net.pdfik:pdfik-client:0.2.0'
 ```
 
 ## Quick Start
@@ -146,6 +146,41 @@ System.out.println(result.getExpiresAt()); // e.g. 2026-08-05T12:00:00Z
 
 byte[] pdfBytes = client.downloadPdf(job.getJobId()); // sample PDF
 ```
+
+### Factur-X e-invoices
+
+PDFik can produce hybrid e-invoices (Factur-X / ZUGFeRD): a PDF/A-3 file with your UN/CEFACT Cross-Industry-Invoice XML embedded as `factur-x.xml`. Two ways to get one:
+
+**1. From the XML alone (`einvoiceToPdf`)** — PDFik builds the human-readable invoice from the XML with a block template (the account default, a saved dashboard template via `templateId`, or an inline `template`), renders it to PDF/A-3 and embeds the XML. The normal job flow applies afterwards (`waitForJob` + `downloadPdf`):
+
+```java
+// Simplest form: default template, profile defaults to en16931
+JobCreatedResponse job = client.einvoiceToPdf(ciiXml);
+
+// Full control via the request class (+ optional Idempotency-Key)
+EInvoiceToPdfRequest request = new EInvoiceToPdfRequest(ciiXml);
+request.setProfile("extended");   // minimum | basicwl | basic | en16931 | extended
+request.setTemplateId("tpl_..."); // saved dashboard template; mutually exclusive with setTemplate(...)
+job = client.einvoiceToPdf(request, "invoice-2026-001");
+
+JobStatusResponse result = client.waitForJob(job.getJobId());
+byte[] pdfA3 = client.downloadPdf(job.getJobId());
+```
+
+**2. Attached to your own rendering (`einvoice` option on `urlToPdf` / `htmlToPdf`)** — the page you render becomes the visual half of the hybrid; the output is normalized to PDF/A-3 with the XML embedded:
+
+```java
+EInvoiceOptions einvoice = new EInvoiceOptions(ciiXml, "en16931");
+JobCreatedResponse job = client.htmlToPdf(invoiceHtml, null, null, null, einvoice, null, null);
+```
+
+Notes:
+
+- The XML (UTF-8, up to 1 MB) is validated against the official XSD of the declared profile before any quota is spent; its `GuidelineSpecifiedDocumentContextParameter` must match the profile. TypeCode 380 (invoice) and 381 (credit note) are supported. Invalid XML returns `422` ([einvoice-xml-invalid](https://docs.pdfik.net/error-codes#einvoice-xml-invalid)).
+- The output is validated with veraPDF and Mustangproject. Schema-valid does not mean tax-compliant — the invoice content remains your responsibility.
+- Profiles `minimum` and `basicwl` carry accompanying data only and are NOT a legally sufficient e-invoice; use `basic`, `en16931` or `extended` for a full invoice.
+- The `einvoice` option is mutually exclusive with `userPassword` (PDF/A forbids encryption) and `compression` (re-saving breaks the PDF/A attributes).
+- Available on every plan, Free included — the output is the same clean PDF/A-3.
 
 ## Limits, retention and error codes
 

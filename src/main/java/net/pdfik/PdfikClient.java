@@ -151,7 +151,11 @@ public class PdfikClient implements AutoCloseable {
                 if (node.has("detail")) {
                     message = node.get("detail").asText();
                 }
-                if (node.has("error_code")) {
+                // pdf-api's RFC 7807 bodies carry the code in "error";
+                // "error_code" is a fallback for any body that still uses it.
+                if (node.hasNonNull("error")) {
+                    errorCode = node.get("error").asText();
+                } else if (node.hasNonNull("error_code")) {
                     errorCode = node.get("error_code").asText();
                 }
             } catch (Exception ignored) {}
@@ -239,7 +243,22 @@ public class PdfikClient implements AutoCloseable {
      *                       payloads always carry {@code test: true|false}.
      */
     public JobCreatedResponse urlToPdf(String url, PdfOptions options, RenderOptions render, String webhookUrl, JobAuthOptions auth, String idempotencyKey, Boolean test) {
-        UrlToPdfRequest body = new UrlToPdfRequest(url, webhookUrl, options, render, auth, test);
+        return urlToPdf(url, options, render, webhookUrl, auth, null, idempotencyKey, test);
+    }
+
+    /**
+     * @param einvoice       optional Factur-X e-invoicing: the rendered page becomes the
+     *                       human-readable half of a hybrid e-invoice — the output is
+     *                       normalized to PDF/A-3 with the XML embedded as
+     *                       {@code factur-x.xml}. Mutually exclusive with
+     *                       {@code options.userPassword} and {@code options.compression}.
+     * @param idempotencyKey optional Idempotency-Key; retrying with the same key
+     *                       returns the original job instead of creating a duplicate
+     * @param test           optional test-mode flag, see
+     *                       {@link #urlToPdf(String, PdfOptions, RenderOptions, String, JobAuthOptions, String, Boolean)}
+     */
+    public JobCreatedResponse urlToPdf(String url, PdfOptions options, RenderOptions render, String webhookUrl, JobAuthOptions auth, EInvoiceOptions einvoice, String idempotencyKey, Boolean test) {
+        UrlToPdfRequest body = new UrlToPdfRequest(url, webhookUrl, options, render, auth, einvoice, test);
         HttpResponse<String> response = executeWithRetry(createPostRequest("/url-to-pdf", body, idempotencyKey), HttpResponse.BodyHandlers.ofString());
         checkResponse(response);
         try {
@@ -290,8 +309,74 @@ public class PdfikClient implements AutoCloseable {
      *                       payloads always carry {@code test: true|false}.
      */
     public JobCreatedResponse htmlToPdf(String html, PdfOptions options, RenderOptions render, String webhookUrl, String idempotencyKey, Boolean test) {
-        HtmlToPdfRequest body = new HtmlToPdfRequest(html, webhookUrl, options, render, test);
+        return htmlToPdf(html, options, render, webhookUrl, null, idempotencyKey, test);
+    }
+
+    /**
+     * @param einvoice       optional Factur-X e-invoicing: the rendered page becomes the
+     *                       human-readable half of a hybrid e-invoice — the output is
+     *                       normalized to PDF/A-3 with the XML embedded as
+     *                       {@code factur-x.xml}. Mutually exclusive with
+     *                       {@code options.userPassword} and {@code options.compression}.
+     * @param idempotencyKey optional Idempotency-Key; retrying with the same key
+     *                       returns the original job instead of creating a duplicate
+     * @param test           optional test-mode flag, see
+     *                       {@link #htmlToPdf(String, PdfOptions, RenderOptions, String, String, Boolean)}
+     */
+    public JobCreatedResponse htmlToPdf(String html, PdfOptions options, RenderOptions render, String webhookUrl, EInvoiceOptions einvoice, String idempotencyKey, Boolean test) {
+        HtmlToPdfRequest body = new HtmlToPdfRequest(html, webhookUrl, options, render, einvoice, test);
         HttpResponse<String> response = executeWithRetry(createPostRequest("/html-to-pdf", body, idempotencyKey), HttpResponse.BodyHandlers.ofString());
+        checkResponse(response);
+        try {
+            return objectMapper.readValue(response.body(), JobCreatedResponse.class);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse response body", e);
+        }
+    }
+
+    /**
+     * Generates a Factur-X e-invoice PDF from UN/CEFACT Cross-Industry-Invoice XML
+     * using the account default block template and the default "en16931" profile.
+     * PDFik builds the human-readable invoice, renders it to PDF/A-3 and embeds the
+     * XML as {@code factur-x.xml}; then poll {@code getJob}/{@code waitForJob} and
+     * download as usual. The output is the same clean PDF/A-3 on every plan.
+     */
+    public JobCreatedResponse einvoiceToPdf(String xml) {
+        return einvoiceToPdf(new EInvoiceToPdfRequest(xml), null);
+    }
+
+    /**
+     * @param test test-mode flag: when {@code true} the job goes through the full
+     *             pipeline (statuses, webhook, download) without real rendering, and
+     *             the download returns a sample PDF. Quotas are not debited — test
+     *             jobs are free and rate-limited instead (60/min, 2,000/day).
+     */
+    public JobCreatedResponse einvoiceToPdf(String xml, boolean test) {
+        EInvoiceToPdfRequest body = new EInvoiceToPdfRequest(xml);
+        body.setTest(test);
+        return einvoiceToPdf(body, null);
+    }
+
+    /**
+     * @param profile Factur-X conformance profile the XML declares: "minimum",
+     *                "basicwl", "basic", "en16931" or "extended". "minimum" and
+     *                "basicwl" are accompanying data only and are NOT a legally
+     *                sufficient e-invoice.
+     */
+    public JobCreatedResponse einvoiceToPdf(String xml, String profile) {
+        return einvoiceToPdf(new EInvoiceToPdfRequest(xml, profile), null);
+    }
+
+    public JobCreatedResponse einvoiceToPdf(EInvoiceToPdfRequest request) {
+        return einvoiceToPdf(request, null);
+    }
+
+    /**
+     * @param idempotencyKey optional Idempotency-Key; retrying with the same key
+     *                       returns the original job instead of creating a duplicate
+     */
+    public JobCreatedResponse einvoiceToPdf(EInvoiceToPdfRequest request, String idempotencyKey) {
+        HttpResponse<String> response = executeWithRetry(createPostRequest("/einvoice-to-pdf", request, idempotencyKey), HttpResponse.BodyHandlers.ofString());
         checkResponse(response);
         try {
             return objectMapper.readValue(response.body(), JobCreatedResponse.class);
@@ -393,7 +478,20 @@ public class PdfikClient implements AutoCloseable {
      *             Job status and webhook payloads always carry {@code test: true|false}.
      */
     public CompletableFuture<JobCreatedResponse> urlToPdfAsync(String url, PdfOptions options, RenderOptions render, String webhookUrl, JobAuthOptions auth, Boolean test) {
-        UrlToPdfRequest body = new UrlToPdfRequest(url, webhookUrl, options, render, auth, test);
+        return urlToPdfAsync(url, options, render, webhookUrl, auth, null, test);
+    }
+
+    /**
+     * @param einvoice optional Factur-X e-invoicing: the rendered page becomes the
+     *                 human-readable half of a hybrid e-invoice — the output is
+     *                 normalized to PDF/A-3 with the XML embedded as
+     *                 {@code factur-x.xml}. Mutually exclusive with
+     *                 {@code options.userPassword} and {@code options.compression}.
+     * @param test     optional test-mode flag, see
+     *                 {@link #urlToPdfAsync(String, PdfOptions, RenderOptions, String, JobAuthOptions, Boolean)}
+     */
+    public CompletableFuture<JobCreatedResponse> urlToPdfAsync(String url, PdfOptions options, RenderOptions render, String webhookUrl, JobAuthOptions auth, EInvoiceOptions einvoice, Boolean test) {
+        UrlToPdfRequest body = new UrlToPdfRequest(url, webhookUrl, options, render, auth, einvoice, test);
         return executeWithRetryAsync(createPostRequest("/url-to-pdf", body), HttpResponse.BodyHandlers.ofString())
                 .thenApply(response -> {
                     checkResponse(response);
@@ -435,8 +533,64 @@ public class PdfikClient implements AutoCloseable {
      *             Job status and webhook payloads always carry {@code test: true|false}.
      */
     public CompletableFuture<JobCreatedResponse> htmlToPdfAsync(String html, PdfOptions options, RenderOptions render, String webhookUrl, Boolean test) {
-        HtmlToPdfRequest body = new HtmlToPdfRequest(html, webhookUrl, options, render, test);
+        return htmlToPdfAsync(html, options, render, webhookUrl, null, test);
+    }
+
+    /**
+     * @param einvoice optional Factur-X e-invoicing: the rendered page becomes the
+     *                 human-readable half of a hybrid e-invoice — the output is
+     *                 normalized to PDF/A-3 with the XML embedded as
+     *                 {@code factur-x.xml}. Mutually exclusive with
+     *                 {@code options.userPassword} and {@code options.compression}.
+     * @param test     optional test-mode flag, see
+     *                 {@link #htmlToPdfAsync(String, PdfOptions, RenderOptions, String, Boolean)}
+     */
+    public CompletableFuture<JobCreatedResponse> htmlToPdfAsync(String html, PdfOptions options, RenderOptions render, String webhookUrl, EInvoiceOptions einvoice, Boolean test) {
+        HtmlToPdfRequest body = new HtmlToPdfRequest(html, webhookUrl, options, render, einvoice, test);
         return executeWithRetryAsync(createPostRequest("/html-to-pdf", body), HttpResponse.BodyHandlers.ofString())
+                .thenApply(response -> {
+                    checkResponse(response);
+                    try {
+                        return objectMapper.readValue(response.body(), JobCreatedResponse.class);
+                    } catch (Exception e) {
+                        throw new CompletionException("Failed to parse response body", e);
+                    }
+                });
+    }
+
+    /**
+     * Asynchronous variant of {@link #einvoiceToPdf(String)}: generates a Factur-X
+     * e-invoice PDF from UN/CEFACT Cross-Industry-Invoice XML using the account
+     * default block template and the default "en16931" profile.
+     */
+    public CompletableFuture<JobCreatedResponse> einvoiceToPdfAsync(String xml) {
+        return einvoiceToPdfAsync(new EInvoiceToPdfRequest(xml));
+    }
+
+    /**
+     * @param test test-mode flag: when {@code true} the job goes through the full
+     *             pipeline (statuses, webhook, download) without real rendering, and
+     *             the download returns a sample PDF. Quotas are not debited — test
+     *             jobs are free and rate-limited instead (60/min, 2,000/day).
+     */
+    public CompletableFuture<JobCreatedResponse> einvoiceToPdfAsync(String xml, boolean test) {
+        EInvoiceToPdfRequest body = new EInvoiceToPdfRequest(xml);
+        body.setTest(test);
+        return einvoiceToPdfAsync(body);
+    }
+
+    /**
+     * @param profile Factur-X conformance profile the XML declares: "minimum",
+     *                "basicwl", "basic", "en16931" or "extended". "minimum" and
+     *                "basicwl" are accompanying data only and are NOT a legally
+     *                sufficient e-invoice.
+     */
+    public CompletableFuture<JobCreatedResponse> einvoiceToPdfAsync(String xml, String profile) {
+        return einvoiceToPdfAsync(new EInvoiceToPdfRequest(xml, profile));
+    }
+
+    public CompletableFuture<JobCreatedResponse> einvoiceToPdfAsync(EInvoiceToPdfRequest request) {
+        return executeWithRetryAsync(createPostRequest("/einvoice-to-pdf", request), HttpResponse.BodyHandlers.ofString())
                 .thenApply(response -> {
                     checkResponse(response);
                     try {

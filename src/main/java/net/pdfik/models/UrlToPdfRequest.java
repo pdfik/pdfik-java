@@ -8,6 +8,7 @@ public class UrlToPdfRequest {
     private PdfOptions options;
     private RenderOptions render;
     private JobAuthOptions auth;
+    private EInvoiceOptions einvoice;
     /** Test mode flag; omitted from the request body when null (defaults to a live job). */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private Boolean test;
@@ -38,6 +39,16 @@ public class UrlToPdfRequest {
         this.test = test;
     }
 
+    public UrlToPdfRequest(String url, String webhookUrl, PdfOptions options, RenderOptions render, JobAuthOptions auth, EInvoiceOptions einvoice, Boolean test) {
+        this.url = url;
+        this.webhookUrl = webhookUrl;
+        this.options = options;
+        this.render = render;
+        this.auth = auth;
+        this.einvoice = einvoice;
+        this.test = test;
+    }
+
     public String getUrl() { return url; }
     public void setUrl(String url) { this.url = url; }
 
@@ -52,6 +63,9 @@ public class UrlToPdfRequest {
 
     public JobAuthOptions getAuth() { return auth; }
     public void setAuth(JobAuthOptions auth) { this.auth = auth; }
+
+    public EInvoiceOptions getEinvoice() { return einvoice; }
+    public void setEinvoice(EInvoiceOptions einvoice) { this.einvoice = einvoice; }
 
     public Boolean getTest() { return test; }
     public void setTest(Boolean test) { this.test = test; }

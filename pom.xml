@@ -5,7 +5,7 @@
 
   <groupId>net.pdfik</groupId>
   <artifactId>pdfik-client</artifactId>
-  <version>0.1.5</version>
+  <version>0.2.0</version>
   <name>pdfik-client</name>
   <description>Official Java SDK for the PDFik PDF generation API</description>
   <url>https://pdfik.net</url>

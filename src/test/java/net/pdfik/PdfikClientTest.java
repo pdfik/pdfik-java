@@ -96,6 +96,118 @@ public class PdfikClientTest {
     }
 
     @Test
+    public void testEinvoiceToPdfSendsXmlAndOmitsUnsetProfile() {
+        wireMockServer.stubFor(post(urlEqualTo("/einvoice-to-pdf"))
+                .withHeader("X-API-Key", equalTo("sk_test_123"))
+                .withHeader("Content-Type", equalTo("application/json"))
+                .withRequestBody(matchingJsonPath("$.xml", equalTo("<rsm:CrossIndustryInvoice/>")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-einv\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        JobCreatedResponse response = client.einvoiceToPdf("<rsm:CrossIndustryInvoice/>");
+
+        assertNotNull(response);
+        assertEquals("job-einv", response.getJobId());
+        assertEquals("queued", response.getStatus());
+        // profile is omitted when unset (the server defaults to en16931)
+        wireMockServer.verify(postRequestedFor(urlEqualTo("/einvoice-to-pdf"))
+                .withRequestBody(notContaining("\"profile\"")));
+    }
+
+    @Test
+    public void testEinvoiceToPdfFullRequestSendsProfileTemplateIdAndIdempotencyKey() {
+        wireMockServer.stubFor(post(urlEqualTo("/einvoice-to-pdf"))
+                .withHeader("Idempotency-Key", equalTo("einv-key-1"))
+                .withRequestBody(matchingJsonPath("$.profile", equalTo("extended")))
+                .withRequestBody(matchingJsonPath("$.template_id", equalTo("tpl-123")))
+                .withRequestBody(matchingJsonPath("$.webhook_url", equalTo("https://example.com/hook")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-einv-2\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        EInvoiceToPdfRequest request = new EInvoiceToPdfRequest("<rsm:CrossIndustryInvoice/>");
+        request.setProfile("extended");
+        request.setTemplateId("tpl-123");
+        request.setWebhookUrl("https://example.com/hook");
+        JobCreatedResponse response = client.einvoiceToPdf(request, "einv-key-1");
+
+        assertNotNull(response);
+        assertEquals("job-einv-2", response.getJobId());
+    }
+
+    @Test
+    public void testEinvoiceToPdfXmlInvalidNoRetry() {
+        wireMockServer.stubFor(post(urlEqualTo("/einvoice-to-pdf"))
+                .willReturn(aResponse()
+                        .withStatus(422)
+                        .withHeader("Content-Type", "application/problem+json")
+                        .withBody("{\"type\":\"https://docs.pdfik.net/error-codes#einvoice-xml-invalid\",\"title\":\"Unprocessable Entity - Invoice XML Invalid\",\"status\":422,\"error\":\"EINVOICE_XML_INVALID\",\"detail\":\"XML failed XSD validation\"}")));
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> {
+            client.einvoiceToPdf("<broken/>");
+        });
+
+        assertEquals(422, exception.getStatusCode());
+        assertEquals("XML failed XSD validation", exception.getMessage());
+        assertTrue(exception.getResponseBody().contains("EINVOICE_XML_INVALID"));
+        wireMockServer.verify(1, postRequestedFor(urlEqualTo("/einvoice-to-pdf")));
+    }
+
+    @Test
+    public void testEinvoiceToPdfAsync() throws ExecutionException, InterruptedException {
+        wireMockServer.stubFor(post(urlEqualTo("/einvoice-to-pdf"))
+                .withRequestBody(matchingJsonPath("$.profile", equalTo("basic")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-einv-async\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        CompletableFuture<JobCreatedResponse> future = client.einvoiceToPdfAsync("<rsm:CrossIndustryInvoice/>", "basic");
+        JobCreatedResponse response = future.get();
+
+        assertNotNull(response);
+        assertEquals("job-einv-async", response.getJobId());
+    }
+
+    @Test
+    public void testUrlToPdfWithEinvoiceOptionSendsEinvoiceBlock() {
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-pdf"))
+                .withRequestBody(matchingJsonPath("$.einvoice.format", equalTo("factur-x")))
+                .withRequestBody(matchingJsonPath("$.einvoice.profile", equalTo("en16931")))
+                .withRequestBody(matchingJsonPath("$.einvoice.xml", equalTo("<rsm:CrossIndustryInvoice/>")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-einv-url\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        EInvoiceOptions einvoice = new EInvoiceOptions("<rsm:CrossIndustryInvoice/>", "en16931");
+        JobCreatedResponse response = client.urlToPdf("https://example.com/invoice", null, null, null, null, einvoice, null, null);
+
+        assertNotNull(response);
+        assertEquals("job-einv-url", response.getJobId());
+    }
+
+    @Test
+    public void testHtmlToPdfWithEinvoiceOptionSendsEinvoiceBlock() {
+        wireMockServer.stubFor(post(urlEqualTo("/html-to-pdf"))
+                .withRequestBody(matchingJsonPath("$.einvoice.format", equalTo("factur-x")))
+                .withRequestBody(matchingJsonPath("$.einvoice.xml", equalTo("<rsm:CrossIndustryInvoice/>")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-einv-html\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        JobCreatedResponse response = client.htmlToPdf("<h1>Invoice</h1>", null, null, null,
+                new EInvoiceOptions("<rsm:CrossIndustryInvoice/>"), null, null);
+
+        assertNotNull(response);
+        assertEquals("job-einv-html", response.getJobId());
+    }
+
+    @Test
     public void testWaitForJobPolls() {
         wireMockServer.stubFor(get(urlEqualTo("/jobs/job-123"))
                 .inScenario("Polling")
