@@ -9,6 +9,13 @@ public class UrlToPdfRequest {
     private RenderOptions render;
     private JobAuthOptions auth;
     private EInvoiceOptions einvoice;
+    /**
+     * BYOB delivery (Pro+): upload the output straight to your own bucket via
+     * a presigned PUT URL. Omitted from the request body when null. Not
+     * combinable with test mode.
+     */
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private DeliveryOptions delivery;
     /** Test mode flag; omitted from the request body when null (defaults to a live job). */
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private Boolean test;
@@ -66,6 +73,9 @@ public class UrlToPdfRequest {
 
     public EInvoiceOptions getEinvoice() { return einvoice; }
     public void setEinvoice(EInvoiceOptions einvoice) { this.einvoice = einvoice; }
+
+    public DeliveryOptions getDelivery() { return delivery; }
+    public void setDelivery(DeliveryOptions delivery) { this.delivery = delivery; }
 
     public Boolean getTest() { return test; }
     public void setTest(Boolean test) { this.test = test; }

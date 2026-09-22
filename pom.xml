@@ -5,7 +5,7 @@
 
   <groupId>net.pdfik</groupId>
   <artifactId>pdfik-client</artifactId>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
   <name>pdfik-client</name>
   <description>Official Java SDK for the PDFik PDF generation API</description>
   <url>https://pdfik.net</url>
@@ -33,8 +33,9 @@
   </scm>
 
   <properties>
-    <maven.compiler.source>11</maven.compiler.source>
-    <maven.compiler.target>11</maven.compiler.target>
+    <!-- release, not source/target: only release checks the JDK API level, so a Java 12+
+         call (exceptionallyCompose) compiled fine on a newer JDK and failed on Java 11. -->
+    <maven.compiler.release>11</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <jackson.version>2.17.0</jackson.version>
     <junit.version>5.10.0</junit.version>
@@ -77,8 +78,7 @@
         <artifactId>maven-compiler-plugin</artifactId>
         <version>3.11.0</version>
         <configuration>
-          <source>11</source>
-          <target>11</target>
+          <release>11</release>
         </configuration>
       </plugin>
       <!-- Surefire Plugin for running tests -->

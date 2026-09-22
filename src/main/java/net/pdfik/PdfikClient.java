@@ -38,6 +38,7 @@ public class PdfikClient implements AutoCloseable {
         this.objectMapper = new ObjectMapper()
                 .setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE)
                 .registerModule(new JavaTimeModule())
+                .registerModule(LenientInstant.module())
                 .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
 
         this.scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
@@ -119,22 +120,77 @@ public class PdfikClient implements AutoCloseable {
                     }
                     return CompletableFuture.completedFuture(response);
                 })
-                .exceptionallyCompose(ex -> {
-                    if (attempt < 3) {
-                        long delay = (long) (Math.pow(2, attempt - 1) * 1000);
-                        CompletableFuture<HttpResponse<T>> delayedFuture = new CompletableFuture<>();
-                        scheduler.schedule(() -> {
-                            executeWithRetryAsync(requestSupplier, responseBodyHandler, attempt + 1)
-                                    .whenComplete((res, ex2) -> {
-                                        if (ex2 != null) delayedFuture.completeExceptionally(ex2);
-                                        else delayedFuture.complete(res);
-                                    });
-                        }, delay, TimeUnit.MILLISECONDS);
-                        return delayedFuture;
-                    }
-                    Throwable actualEx = (ex instanceof CompletionException) ? ex.getCause() : ex;
-                    return CompletableFuture.failedFuture(new PdfikException("Connection failed: " + actualEx.getMessage(), 503, null, null));
-                });
+                // Not exceptionallyCompose(): that is Java 12+, and this SDK promises Java 11.
+                // handle() + thenCompose() is the Java 11 spelling of the same thing.
+                .handle((response, ex) -> ex == null
+                        ? CompletableFuture.completedFuture(response)
+                        : retryAfterFailure(requestSupplier, responseBodyHandler, attempt, ex))
+                .thenCompose(f -> f);
+    }
+
+    private <T> CompletableFuture<HttpResponse<T>> retryAfterFailure(
+            Supplier<HttpRequest> requestSupplier,
+            HttpResponse.BodyHandler<T> responseBodyHandler,
+            int attempt,
+            Throwable ex) {
+        if (attempt < 3) {
+            long delay = (long) (Math.pow(2, attempt - 1) * 1000);
+            CompletableFuture<HttpResponse<T>> delayedFuture = new CompletableFuture<>();
+            scheduler.schedule(() -> {
+                executeWithRetryAsync(requestSupplier, responseBodyHandler, attempt + 1)
+                        .whenComplete((res, ex2) -> {
+                            if (ex2 != null) delayedFuture.completeExceptionally(ex2);
+                            else delayedFuture.complete(res);
+                        });
+            }, delay, TimeUnit.MILLISECONDS);
+            return delayedFuture;
+        }
+        Throwable actualEx = (ex instanceof CompletionException) ? ex.getCause() : ex;
+        // An API error (4xx after retries) is already a PdfikException: keep it.
+        if (actualEx instanceof PdfikException) return CompletableFuture.failedFuture(actualEx);
+        return CompletableFuture.failedFuture(new PdfikException("Connection failed: " + actualEx.getMessage(), 503, null, null));
+    }
+
+    /**
+     * Readable text for an error body's {@code detail}. Request-validation errors (422)
+     * carry an ARRAY of {@code {loc, msg}} items; {@code asText()} on an array is "",
+     * so the message used to be empty. They read as
+     * "options.viewport.width: Input should be less than or equal to 1920".
+     */
+    /**
+     * Milliseconds to wait after a 429 while polling: the API's {@code retry_after_seconds}
+     * (capped at 60 s so the server cannot park the caller), else {@code fallbackMs}.
+     */
+    long throttleDelayMs(PdfikException e, long fallbackMs) {
+        try {
+            JsonNode node = objectMapper.readTree(e.getResponseBody() == null ? "{}" : e.getResponseBody());
+            long seconds = node.path("retry_after_seconds").asLong(0);
+            if (seconds > 0) return Math.min(seconds, 60) * 1000L;
+        } catch (Exception ignored) {
+            // not JSON — fall back
+        }
+        return fallbackMs;
+    }
+
+    static String errorDetail(JsonNode detail) {
+        if (detail == null || detail.isNull()) return null;
+        if (detail.isArray()) {
+            StringBuilder sb = new StringBuilder();
+            for (JsonNode item : detail) {
+                StringBuilder loc = new StringBuilder();
+                for (JsonNode part : item.path("loc")) {
+                    if ("body".equals(part.asText())) continue;
+                    if (loc.length() > 0) loc.append('.');
+                    loc.append(part.asText());
+                }
+                String msg = item.hasNonNull("msg") ? item.get("msg").asText() : item.toString();
+                if (sb.length() > 0) sb.append("; ");
+                sb.append(loc.length() > 0 ? loc + ": " + msg : msg);
+            }
+            return sb.length() > 0 ? sb.toString() : null;
+        }
+        String text = detail.isTextual() ? detail.asText() : detail.toString();
+        return text.isEmpty() ? null : text;
     }
 
     private <T> void checkResponse(HttpResponse<T> response) {
@@ -148,8 +204,9 @@ public class PdfikClient implements AutoCloseable {
             String errorCode = null;
             try {
                 JsonNode node = objectMapper.readTree(body);
-                if (node.has("detail")) {
-                    message = node.get("detail").asText();
+                String detail = errorDetail(node.get("detail"));
+                if (detail != null) {
+                    message = detail;
                 }
                 // pdf-api's RFC 7807 bodies carry the code in "error";
                 // "error_code" is a fallback for any body that still uses it.
@@ -259,7 +316,25 @@ public class PdfikClient implements AutoCloseable {
      */
     public JobCreatedResponse urlToPdf(String url, PdfOptions options, RenderOptions render, String webhookUrl, JobAuthOptions auth, EInvoiceOptions einvoice, String idempotencyKey, Boolean test) {
         UrlToPdfRequest body = new UrlToPdfRequest(url, webhookUrl, options, render, auth, einvoice, test);
-        HttpResponse<String> response = executeWithRetry(createPostRequest("/url-to-pdf", body, idempotencyKey), HttpResponse.BodyHandlers.ofString());
+        return urlToPdf(body, idempotencyKey);
+    }
+
+    /**
+     * Request-object variant of {@code urlToPdf} — gives access to every field,
+     * including {@code delivery} (BYOB: the output is uploaded straight to your
+     * own bucket via a presigned PUT URL, nothing is stored on PDFik's side;
+     * not combinable with test mode).
+     */
+    public JobCreatedResponse urlToPdf(UrlToPdfRequest request) {
+        return urlToPdf(request, null);
+    }
+
+    /**
+     * @param idempotencyKey optional Idempotency-Key; retrying with the same key
+     *                       returns the original job instead of creating a duplicate
+     */
+    public JobCreatedResponse urlToPdf(UrlToPdfRequest request, String idempotencyKey) {
+        HttpResponse<String> response = executeWithRetry(createPostRequest("/url-to-pdf", request, idempotencyKey), HttpResponse.BodyHandlers.ofString());
         checkResponse(response);
         try {
             return objectMapper.readValue(response.body(), JobCreatedResponse.class);
@@ -325,7 +400,25 @@ public class PdfikClient implements AutoCloseable {
      */
     public JobCreatedResponse htmlToPdf(String html, PdfOptions options, RenderOptions render, String webhookUrl, EInvoiceOptions einvoice, String idempotencyKey, Boolean test) {
         HtmlToPdfRequest body = new HtmlToPdfRequest(html, webhookUrl, options, render, einvoice, test);
-        HttpResponse<String> response = executeWithRetry(createPostRequest("/html-to-pdf", body, idempotencyKey), HttpResponse.BodyHandlers.ofString());
+        return htmlToPdf(body, idempotencyKey);
+    }
+
+    /**
+     * Request-object variant of {@code htmlToPdf} — gives access to every field,
+     * including {@code delivery} (BYOB: the output is uploaded straight to your
+     * own bucket via a presigned PUT URL, nothing is stored on PDFik's side;
+     * not combinable with test mode).
+     */
+    public JobCreatedResponse htmlToPdf(HtmlToPdfRequest request) {
+        return htmlToPdf(request, null);
+    }
+
+    /**
+     * @param idempotencyKey optional Idempotency-Key; retrying with the same key
+     *                       returns the original job instead of creating a duplicate
+     */
+    public JobCreatedResponse htmlToPdf(HtmlToPdfRequest request, String idempotencyKey) {
+        HttpResponse<String> response = executeWithRetry(createPostRequest("/html-to-pdf", request, idempotencyKey), HttpResponse.BodyHandlers.ofString());
         checkResponse(response);
         try {
             return objectMapper.readValue(response.body(), JobCreatedResponse.class);
@@ -385,6 +478,107 @@ public class PdfikClient implements AutoCloseable {
         }
     }
 
+    /**
+     * Converts Markdown (CommonMark + GFM tables and strikethrough) to a PDF
+     * with a built-in print stylesheet. Raw HTML inside the Markdown is
+     * escaped, not rendered — use {@code htmlToPdf} for full HTML control.
+     * Job polling and download work exactly as on the other PDF endpoints.
+     */
+    public JobCreatedResponse markdownToPdf(String markdown) {
+        return markdownToPdf(new MarkdownToPdfRequest(markdown), null);
+    }
+
+    /**
+     * Full-control variant: the request object carries {@code options} (paper
+     * format, margins, header/footer, watermark, ... — same as
+     * {@code htmlToPdf}), {@code render}, {@code webhookUrl},
+     * {@code delivery} (BYOB) and {@code test}.
+     */
+    public JobCreatedResponse markdownToPdf(MarkdownToPdfRequest request) {
+        return markdownToPdf(request, null);
+    }
+
+    /**
+     * @param idempotencyKey optional Idempotency-Key; retrying with the same key
+     *                       returns the original job instead of creating a duplicate
+     */
+    public JobCreatedResponse markdownToPdf(MarkdownToPdfRequest request, String idempotencyKey) {
+        HttpResponse<String> response = executeWithRetry(createPostRequest("/markdown-to-pdf", request, idempotencyKey), HttpResponse.BodyHandlers.ofString());
+        checkResponse(response);
+        try {
+            return objectMapper.readValue(response.body(), JobCreatedResponse.class);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse response body", e);
+        }
+    }
+
+    /**
+     * Captures a public URL as a PNG screenshot of the full scrollable page
+     * (the server defaults). Poll with {@code waitForJob} and fetch the bytes
+     * with {@code downloadPdf} — for image jobs it returns the raw
+     * {@code image/png} or {@code image/jpeg} bytes instead of a PDF.
+     */
+    public JobCreatedResponse urlToImage(String url) {
+        return urlToImage(new UrlToImageRequest(url), null);
+    }
+
+    /**
+     * Full-control variant: the request object carries {@code options}
+     * (format png/jpeg, fullPage, quality, viewport), {@code render},
+     * {@code webhookUrl}, {@code auth} (Pro+), {@code delivery} (BYOB) and
+     * {@code test}.
+     */
+    public JobCreatedResponse urlToImage(UrlToImageRequest request) {
+        return urlToImage(request, null);
+    }
+
+    /**
+     * @param idempotencyKey optional Idempotency-Key; retrying with the same key
+     *                       returns the original job instead of creating a duplicate
+     */
+    public JobCreatedResponse urlToImage(UrlToImageRequest request, String idempotencyKey) {
+        HttpResponse<String> response = executeWithRetry(createPostRequest("/url-to-image", request, idempotencyKey), HttpResponse.BodyHandlers.ofString());
+        checkResponse(response);
+        try {
+            return objectMapper.readValue(response.body(), JobCreatedResponse.class);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse response body", e);
+        }
+    }
+
+    /**
+     * Captures raw HTML markup as a PNG screenshot of the full scrollable
+     * page (the server defaults). Poll with {@code waitForJob} and fetch the
+     * bytes with {@code downloadPdf} — for image jobs it returns the raw
+     * {@code image/png} or {@code image/jpeg} bytes instead of a PDF.
+     */
+    public JobCreatedResponse htmlToImage(String html) {
+        return htmlToImage(new HtmlToImageRequest(html), null);
+    }
+
+    /**
+     * Full-control variant: the request object carries {@code options}
+     * (format png/jpeg, fullPage, quality, viewport), {@code render},
+     * {@code webhookUrl}, {@code delivery} (BYOB) and {@code test}.
+     */
+    public JobCreatedResponse htmlToImage(HtmlToImageRequest request) {
+        return htmlToImage(request, null);
+    }
+
+    /**
+     * @param idempotencyKey optional Idempotency-Key; retrying with the same key
+     *                       returns the original job instead of creating a duplicate
+     */
+    public JobCreatedResponse htmlToImage(HtmlToImageRequest request, String idempotencyKey) {
+        HttpResponse<String> response = executeWithRetry(createPostRequest("/html-to-image", request, idempotencyKey), HttpResponse.BodyHandlers.ofString());
+        checkResponse(response);
+        try {
+            return objectMapper.readValue(response.body(), JobCreatedResponse.class);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse response body", e);
+        }
+    }
+
     public JobStatusResponse getJob(String jobId) {
         HttpResponse<String> response = executeWithRetry(createGetRequest("/jobs/" + jobId), HttpResponse.BodyHandlers.ofString());
         checkResponse(response);
@@ -403,7 +597,25 @@ public class PdfikClient implements AutoCloseable {
         long startTime = System.currentTimeMillis();
         long timeoutMs = timeout.toMillis();
         while (true) {
-            JobStatusResponse job = getJob(jobId);
+            JobStatusResponse job;
+            try {
+                job = getJob(jobId);
+            } catch (PdfikException e) {
+                // A 429 while polling is a throttle, not a failure: on Free (10
+                // requests/min) a render longer than ~20 s used to end the wait with
+                // an error. Wait it out, within the same timeout.
+                if (e.getStatusCode() != 429) throw e;
+                if (System.currentTimeMillis() - startTime >= timeoutMs) {
+                    throw new PdfikException("Job " + jobId + " timed out", 408, "TIMEOUT", null);
+                }
+                try {
+                    Thread.sleep(throttleDelayMs(e, pollInterval.toMillis()));
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new PdfikException("Polling interrupted", 500, null, null);
+                }
+                continue;
+            }
             if (job.getStatus() == JobStatus.DONE || job.getStatus() == JobStatus.FAILED) {
                 if (job.getStatus() == JobStatus.FAILED) {
                     throw new PdfikException(
@@ -436,6 +648,14 @@ public class PdfikClient implements AutoCloseable {
         return res;
     }
 
+    /**
+     * Downloads the finished job's output bytes. Despite the name it works for
+     * every job type: PDF jobs return the PDF, image jobs ({@code urlToImage} /
+     * {@code htmlToImage}) return the raw PNG/JPEG bytes. Jobs submitted with
+     * the {@code delivery} option have no download here — the file lives in
+     * your own bucket (the {@code job.finished} webhook's {@code file_url})
+     * and this endpoint answers 404.
+     */
     public byte[] downloadPdf(String jobId) {
         HttpResponse<byte[]> response = executeWithRetry(createGetRequest("/jobs/" + jobId + "/download"), HttpResponse.BodyHandlers.ofByteArray());
         checkResponse(response);
@@ -492,7 +712,21 @@ public class PdfikClient implements AutoCloseable {
      */
     public CompletableFuture<JobCreatedResponse> urlToPdfAsync(String url, PdfOptions options, RenderOptions render, String webhookUrl, JobAuthOptions auth, EInvoiceOptions einvoice, Boolean test) {
         UrlToPdfRequest body = new UrlToPdfRequest(url, webhookUrl, options, render, auth, einvoice, test);
-        return executeWithRetryAsync(createPostRequest("/url-to-pdf", body), HttpResponse.BodyHandlers.ofString())
+        return urlToPdfAsync(body);
+    }
+
+    /**
+     * Request-object variant of {@code urlToPdfAsync} — gives access to every
+     * field, including {@code delivery} (BYOB: the output is uploaded straight
+     * to your own bucket via a presigned PUT URL; not combinable with test mode).
+     */
+    public CompletableFuture<JobCreatedResponse> urlToPdfAsync(UrlToPdfRequest request) {
+        return urlToPdfAsync(request, null);
+    }
+
+    /** Async twin of {@code urlToPdf(request, idempotencyKey)}: a resend with the same key returns the same job. */
+    public CompletableFuture<JobCreatedResponse> urlToPdfAsync(UrlToPdfRequest request, String idempotencyKey) {
+        return executeWithRetryAsync(createPostRequest("/url-to-pdf", request, idempotencyKey), HttpResponse.BodyHandlers.ofString())
                 .thenApply(response -> {
                     checkResponse(response);
                     try {
@@ -547,7 +781,21 @@ public class PdfikClient implements AutoCloseable {
      */
     public CompletableFuture<JobCreatedResponse> htmlToPdfAsync(String html, PdfOptions options, RenderOptions render, String webhookUrl, EInvoiceOptions einvoice, Boolean test) {
         HtmlToPdfRequest body = new HtmlToPdfRequest(html, webhookUrl, options, render, einvoice, test);
-        return executeWithRetryAsync(createPostRequest("/html-to-pdf", body), HttpResponse.BodyHandlers.ofString())
+        return htmlToPdfAsync(body);
+    }
+
+    /**
+     * Request-object variant of {@code htmlToPdfAsync} — gives access to every
+     * field, including {@code delivery} (BYOB: the output is uploaded straight
+     * to your own bucket via a presigned PUT URL; not combinable with test mode).
+     */
+    public CompletableFuture<JobCreatedResponse> htmlToPdfAsync(HtmlToPdfRequest request) {
+        return htmlToPdfAsync(request, null);
+    }
+
+    /** Async twin of {@code htmlToPdf(request, idempotencyKey)}: a resend with the same key returns the same job. */
+    public CompletableFuture<JobCreatedResponse> htmlToPdfAsync(HtmlToPdfRequest request, String idempotencyKey) {
+        return executeWithRetryAsync(createPostRequest("/html-to-pdf", request, idempotencyKey), HttpResponse.BodyHandlers.ofString())
                 .thenApply(response -> {
                     checkResponse(response);
                     try {
@@ -590,7 +838,97 @@ public class PdfikClient implements AutoCloseable {
     }
 
     public CompletableFuture<JobCreatedResponse> einvoiceToPdfAsync(EInvoiceToPdfRequest request) {
-        return executeWithRetryAsync(createPostRequest("/einvoice-to-pdf", request), HttpResponse.BodyHandlers.ofString())
+        return einvoiceToPdfAsync(request, null);
+    }
+
+    /** Async twin of {@code einvoiceToPdf(request, idempotencyKey)}: a resend with the same key returns the same job. */
+    public CompletableFuture<JobCreatedResponse> einvoiceToPdfAsync(EInvoiceToPdfRequest request, String idempotencyKey) {
+        return executeWithRetryAsync(createPostRequest("/einvoice-to-pdf", request, idempotencyKey), HttpResponse.BodyHandlers.ofString())
+                .thenApply(response -> {
+                    checkResponse(response);
+                    try {
+                        return objectMapper.readValue(response.body(), JobCreatedResponse.class);
+                    } catch (Exception e) {
+                        throw new CompletionException("Failed to parse response body", e);
+                    }
+                });
+    }
+
+    /**
+     * Asynchronous variant of {@link #markdownToPdf(String)}: converts Markdown
+     * (CommonMark + GFM tables and strikethrough) to a PDF with a built-in
+     * print stylesheet.
+     */
+    public CompletableFuture<JobCreatedResponse> markdownToPdfAsync(String markdown) {
+        return markdownToPdfAsync(new MarkdownToPdfRequest(markdown));
+    }
+
+    /**
+     * Asynchronous variant of {@link #markdownToPdf(MarkdownToPdfRequest)}.
+     */
+    public CompletableFuture<JobCreatedResponse> markdownToPdfAsync(MarkdownToPdfRequest request) {
+        return markdownToPdfAsync(request, null);
+    }
+
+    /** Async twin of {@code markdownToPdf(request, idempotencyKey)}: a resend with the same key returns the same job. */
+    public CompletableFuture<JobCreatedResponse> markdownToPdfAsync(MarkdownToPdfRequest request, String idempotencyKey) {
+        return executeWithRetryAsync(createPostRequest("/markdown-to-pdf", request, idempotencyKey), HttpResponse.BodyHandlers.ofString())
+                .thenApply(response -> {
+                    checkResponse(response);
+                    try {
+                        return objectMapper.readValue(response.body(), JobCreatedResponse.class);
+                    } catch (Exception e) {
+                        throw new CompletionException("Failed to parse response body", e);
+                    }
+                });
+    }
+
+    /**
+     * Asynchronous variant of {@link #urlToImage(String)}: captures a public
+     * URL as a PNG screenshot of the full scrollable page (the server defaults).
+     */
+    public CompletableFuture<JobCreatedResponse> urlToImageAsync(String url) {
+        return urlToImageAsync(new UrlToImageRequest(url));
+    }
+
+    /**
+     * Asynchronous variant of {@link #urlToImage(UrlToImageRequest)}.
+     */
+    public CompletableFuture<JobCreatedResponse> urlToImageAsync(UrlToImageRequest request) {
+        return urlToImageAsync(request, null);
+    }
+
+    /** Async twin of {@code urlToImage(request, idempotencyKey)}: a resend with the same key returns the same job. */
+    public CompletableFuture<JobCreatedResponse> urlToImageAsync(UrlToImageRequest request, String idempotencyKey) {
+        return executeWithRetryAsync(createPostRequest("/url-to-image", request, idempotencyKey), HttpResponse.BodyHandlers.ofString())
+                .thenApply(response -> {
+                    checkResponse(response);
+                    try {
+                        return objectMapper.readValue(response.body(), JobCreatedResponse.class);
+                    } catch (Exception e) {
+                        throw new CompletionException("Failed to parse response body", e);
+                    }
+                });
+    }
+
+    /**
+     * Asynchronous variant of {@link #htmlToImage(String)}: captures raw HTML
+     * markup as a PNG screenshot of the full scrollable page (the server defaults).
+     */
+    public CompletableFuture<JobCreatedResponse> htmlToImageAsync(String html) {
+        return htmlToImageAsync(new HtmlToImageRequest(html));
+    }
+
+    /**
+     * Asynchronous variant of {@link #htmlToImage(HtmlToImageRequest)}.
+     */
+    public CompletableFuture<JobCreatedResponse> htmlToImageAsync(HtmlToImageRequest request) {
+        return htmlToImageAsync(request, null);
+    }
+
+    /** Async twin of {@code htmlToImage(request, idempotencyKey)}: a resend with the same key returns the same job. */
+    public CompletableFuture<JobCreatedResponse> htmlToImageAsync(HtmlToImageRequest request, String idempotencyKey) {
+        return executeWithRetryAsync(createPostRequest("/html-to-image", request, idempotencyKey), HttpResponse.BodyHandlers.ofString())
                 .thenApply(response -> {
                     checkResponse(response);
                     try {
@@ -639,6 +977,13 @@ public class PdfikClient implements AutoCloseable {
 
         getJobAsync(jobId).whenComplete((job, ex) -> {
             if (ex != null) {
+                Throwable cause = (ex instanceof CompletionException && ex.getCause() != null) ? ex.getCause() : ex;
+                // Same as the sync wait: a 429 while polling is waited out.
+                if (cause instanceof PdfikException && ((PdfikException) cause).getStatusCode() == 429) {
+                    scheduler.schedule(() -> waitForJobAsyncInternal(jobId, startTime, timeoutMs, pollInterval, resultFuture),
+                            throttleDelayMs((PdfikException) cause, pollInterval.toMillis()), TimeUnit.MILLISECONDS);
+                    return;
+                }
                 resultFuture.completeExceptionally(ex);
                 return;
             }

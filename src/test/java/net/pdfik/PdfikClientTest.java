@@ -157,6 +157,36 @@ public class PdfikClientTest {
     }
 
     @Test
+    public void testValidationErrorDetailListBecomesReadableMessage() {
+        // pdf-api answers request-validation errors (422) with `detail` as an ARRAY;
+        // asText() on it is "", so the message used to be empty.
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-image"))
+                .willReturn(aResponse()
+                        .withStatus(422)
+                        .withHeader("Content-Type", "application/problem+json")
+                        .withBody("{\"type\":\"https://docs.pdfik.net/error-codes#validation-error\",\"status\":422,\"detail\":[{\"loc\":[\"body\",\"options\",\"viewport\",\"width\"],\"msg\":\"Input should be less than or equal to 1920\",\"type\":\"less_than_equal\"}]}")));
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> client.urlToImage("https://example.com"));
+        assertEquals(422, exception.getStatusCode());
+        assertEquals("options.viewport.width: Input should be less than or equal to 1920", exception.getMessage());
+    }
+
+    @Test
+    public void testZonelessTimestampsAreReadAsUtc() {
+        // Until 2026-09-21 the API sent created_at/finished_at without a zone; the default
+        // Instant deserializer rejected them, so every getJob/waitForJob failed.
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-naive"))
+                .willReturn(aResponse()
+                        .withStatus(200)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"status\":\"done\",\"created_at\":\"2026-09-21T11:56:56.932000\",\"finished_at\":\"2026-09-21T11:56:57.006000Z\",\"expires_at\":\"2026-09-22T11:56:57.006000Z\",\"test\":false}")));
+
+        JobStatusResponse status = client.getJob("job-naive");
+        assertEquals(java.time.Instant.parse("2026-09-21T11:56:56.932Z"), status.getCreatedAt());
+        assertEquals(java.time.Instant.parse("2026-09-21T11:56:57.006Z"), status.getFinishedAt());
+    }
+
+    @Test
     public void testEinvoiceToPdfAsync() throws ExecutionException, InterruptedException {
         wireMockServer.stubFor(post(urlEqualTo("/einvoice-to-pdf"))
                 .withRequestBody(matchingJsonPath("$.profile", equalTo("basic")))
@@ -208,6 +238,204 @@ public class PdfikClientTest {
     }
 
     @Test
+    public void testMarkdownToPdfSendsMarkdownAndOptions() {
+        wireMockServer.stubFor(post(urlEqualTo("/markdown-to-pdf"))
+                .withHeader("X-API-Key", equalTo("sk_test_123"))
+                .withHeader("Content-Type", equalTo("application/json"))
+                .withRequestBody(matchingJsonPath("$.markdown", equalTo("# Invoice\n\nHello **world**")))
+                .withRequestBody(matchingJsonPath("$.options.format", equalTo("A4")))
+                .withRequestBody(matchingJsonPath("$.webhook_url", equalTo("https://example.com/hook")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-md\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        MarkdownToPdfRequest request = new MarkdownToPdfRequest("# Invoice\n\nHello **world**");
+        request.setOptions(PdfOptions.builder().format(PaperFormat.A4).build());
+        request.setWebhookUrl("https://example.com/hook");
+        JobCreatedResponse response = client.markdownToPdf(request);
+
+        assertNotNull(response);
+        assertEquals("job-md", response.getJobId());
+        assertEquals("queued", response.getStatus());
+    }
+
+    @Test
+    public void testMarkdownToPdfSimpleFormSendsIdempotencyKeyVariant() {
+        wireMockServer.stubFor(post(urlEqualTo("/markdown-to-pdf"))
+                .withHeader("Idempotency-Key", equalTo("md-key-1"))
+                .withRequestBody(matchingJsonPath("$.markdown", equalTo("# Hi")))
+                .withRequestBody(matchingJsonPath("$.test", equalTo("true")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-md-2\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        MarkdownToPdfRequest request = new MarkdownToPdfRequest("# Hi");
+        request.setTest(true);
+        JobCreatedResponse response = client.markdownToPdf(request, "md-key-1");
+
+        assertNotNull(response);
+        assertEquals("job-md-2", response.getJobId());
+        // unset optional fields are absent from the body, not null
+        wireMockServer.verify(postRequestedFor(urlEqualTo("/markdown-to-pdf"))
+                .withRequestBody(notContaining("\"options\""))
+                .withRequestBody(notContaining("\"delivery\"")));
+    }
+
+    @Test
+    public void testUrlToImageSendsSnakeCaseFullPageAndViewport() {
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-image"))
+                .withRequestBody(matchingJsonPath("$.url", equalTo("https://example.com")))
+                .withRequestBody(matchingJsonPath("$.options.format", equalTo("jpeg")))
+                .withRequestBody(matchingJsonPath("$.options.full_page", equalTo("false")))
+                .withRequestBody(matchingJsonPath("$.options.quality", equalTo("80")))
+                .withRequestBody(matchingJsonPath("$.options.viewport.width", equalTo("1280")))
+                .withRequestBody(matchingJsonPath("$.options.viewport.height", equalTo("720")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-img\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        UrlToImageRequest request = new UrlToImageRequest("https://example.com");
+        request.setOptions(ImageOptions.builder()
+                .format("jpeg")
+                .fullPage(false)
+                .quality(80)
+                .viewport(new ImageViewport(1280, 720))
+                .build());
+        JobCreatedResponse response = client.urlToImage(request);
+
+        assertNotNull(response);
+        assertEquals("job-img", response.getJobId());
+    }
+
+    @Test
+    public void testUrlToImagePassesAuthBlock() {
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-image"))
+                .withRequestBody(matchingJsonPath("$.auth.type", equalTo("bearer")))
+                .withRequestBody(matchingJsonPath("$.auth.value", equalTo("tok-123")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-img-2\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        UrlToImageRequest request = new UrlToImageRequest("https://intranet.example.com/report");
+        request.setAuth(new JobAuthOptions("bearer", "tok-123"));
+        JobCreatedResponse response = client.urlToImage(request);
+
+        assertNotNull(response);
+        assertEquals("job-img-2", response.getJobId());
+    }
+
+    @Test
+    public void testHtmlToImageSimpleFormSendsHtmlOnly() {
+        wireMockServer.stubFor(post(urlEqualTo("/html-to-image"))
+                .withRequestBody(matchingJsonPath("$.html", equalTo("<h1>Hello</h1>")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-img-3\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        JobCreatedResponse response = client.htmlToImage("<h1>Hello</h1>");
+
+        assertNotNull(response);
+        assertEquals("job-img-3", response.getJobId());
+        // options unset: the server defaults apply (png, 1024x768, visible area only)
+        wireMockServer.verify(postRequestedFor(urlEqualTo("/html-to-image"))
+                .withRequestBody(notContaining("\"options\"")));
+    }
+
+    @Test
+    public void testDeliverySendsExplicitPresignedPutMode() {
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-pdf"))
+                .withRequestBody(matchingJsonPath("$.delivery.mode", equalTo("presigned_put")))
+                .withRequestBody(matchingJsonPath("$.delivery.url",
+                        equalTo("https://bucket.s3.eu-central-1.amazonaws.com/report.pdf?X-Amz-Signature=abc")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-byob\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        UrlToPdfRequest request = new UrlToPdfRequest();
+        request.setUrl("https://example.com");
+        // mode is not set by the caller: the model default spells it out
+        request.setDelivery(new DeliveryOptions("https://bucket.s3.eu-central-1.amazonaws.com/report.pdf?X-Amz-Signature=abc"));
+        JobCreatedResponse response = client.urlToPdf(request);
+
+        assertNotNull(response);
+        assertEquals("job-byob", response.getJobId());
+    }
+
+    @Test
+    public void testDeliveryAcceptedByHtmlImageAndEinvoiceRequests() {
+        wireMockServer.stubFor(post(urlEqualTo("/html-to-pdf"))
+                .withRequestBody(matchingJsonPath("$.delivery.mode", equalTo("presigned_put")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-byob-h\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+        wireMockServer.stubFor(post(urlEqualTo("/html-to-image"))
+                .withRequestBody(matchingJsonPath("$.delivery.mode", equalTo("presigned_put")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-byob-i\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+        wireMockServer.stubFor(post(urlEqualTo("/einvoice-to-pdf"))
+                .withRequestBody(matchingJsonPath("$.delivery.mode", equalTo("presigned_put")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-byob-e\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        DeliveryOptions delivery = new DeliveryOptions("https://bucket.example.com/out?sig=1");
+
+        HtmlToPdfRequest htmlRequest = new HtmlToPdfRequest("<h1>Hi</h1>", null, null, null);
+        htmlRequest.setDelivery(delivery);
+        assertEquals("job-byob-h", client.htmlToPdf(htmlRequest).getJobId());
+
+        HtmlToImageRequest imageRequest = new HtmlToImageRequest("<h1>Hi</h1>");
+        imageRequest.setDelivery(delivery);
+        assertEquals("job-byob-i", client.htmlToImage(imageRequest).getJobId());
+
+        EInvoiceToPdfRequest einvoiceRequest = new EInvoiceToPdfRequest("<rsm:CrossIndustryInvoice/>");
+        einvoiceRequest.setDelivery(delivery);
+        assertEquals("job-byob-e", client.einvoiceToPdf(einvoiceRequest).getJobId());
+    }
+
+    @Test
+    public void testUrlToImageAsync() throws ExecutionException, InterruptedException {
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-image"))
+                .withRequestBody(matchingJsonPath("$.url", equalTo("https://example.com")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-img-async\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        CompletableFuture<JobCreatedResponse> future = client.urlToImageAsync("https://example.com");
+        JobCreatedResponse response = future.get();
+
+        assertNotNull(response);
+        assertEquals("job-img-async", response.getJobId());
+    }
+
+    @Test
+    public void testMarkdownToPdfAsync() throws ExecutionException, InterruptedException {
+        wireMockServer.stubFor(post(urlEqualTo("/markdown-to-pdf"))
+                .withRequestBody(matchingJsonPath("$.markdown", equalTo("# Hi")))
+                .willReturn(aResponse()
+                        .withStatus(202)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-md-async\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        CompletableFuture<JobCreatedResponse> future = client.markdownToPdfAsync("# Hi");
+        JobCreatedResponse response = future.get();
+
+        assertNotNull(response);
+        assertEquals("job-md-async", response.getJobId());
+    }
+
+    @Test
     public void testWaitForJobPolls() {
         wireMockServer.stubFor(get(urlEqualTo("/jobs/job-123"))
                 .inScenario("Polling")
@@ -239,6 +467,38 @@ public class PdfikClientTest {
         assertNotNull(response);
         assertEquals(JobStatus.DONE, response.getStatus());
         assertEquals(5, response.getPagesCount());
+    }
+
+    @Test
+    public void testWaitForJobWaitsOutA429() {
+        // Free is 10 requests/min: a render longer than ~20 s used to end the wait with
+        // a 429 once the request-level retries (3) were spent.
+        String throttled = "{\"error\":\"RATE_LIMIT_EXCEEDED\",\"detail\":\"Too many requests. Please try again later.\",\"retry_after_seconds\":1}";
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-429")).inScenario("Throttle")
+                .whenScenarioStateIs(com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED)
+                .willReturn(aResponse().withStatus(429).withHeader("Content-Type", "application/json").withBody(throttled))
+                .willSetStateTo("t2"));
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-429")).inScenario("Throttle").whenScenarioStateIs("t2")
+                .willReturn(aResponse().withStatus(429).withHeader("Content-Type", "application/json").withBody(throttled))
+                .willSetStateTo("t3"));
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-429")).inScenario("Throttle").whenScenarioStateIs("t3")
+                .willReturn(aResponse().withStatus(429).withHeader("Content-Type", "application/json").withBody(throttled))
+                .willSetStateTo("done"));
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-429")).inScenario("Throttle").whenScenarioStateIs("done")
+                .willReturn(aResponse().withStatus(200).withHeader("Content-Type", "application/json").withBody("{\"status\":\"done\"}")));
+
+        JobStatusResponse result = client.waitForJob("job-429", java.time.Duration.ofSeconds(60), java.time.Duration.ofMillis(10));
+        assertEquals(JobStatus.DONE, result.getStatus());
+    }
+
+    @Test
+    public void testAsyncRequestMethodsSendTheIdempotencyKey() throws Exception {
+        wireMockServer.stubFor(post(urlEqualTo("/markdown-to-pdf"))
+                .willReturn(aResponse().withStatus(202).withHeader("Content-Type", "application/json")
+                        .withBody("{\"job_id\":\"job-md\",\"status\":\"queued\",\"detail\":\"ok\"}")));
+        JobCreatedResponse job = client.markdownToPdfAsync(new MarkdownToPdfRequest("# Hi"), "md-key-1").get();
+        assertEquals("job-md", job.getJobId());
+        wireMockServer.verify(postRequestedFor(urlEqualTo("/markdown-to-pdf")).withHeader("Idempotency-Key", equalTo("md-key-1")));
     }
 
     @Test

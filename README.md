@@ -1,6 +1,6 @@
 # pdfik-client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-09-06).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-09-22).
 > Releases to Maven Central are cut from the monorepo; issues and PRs are welcome here.
 
 Official Java SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
@@ -25,7 +25,7 @@ Add the following dependency to your `pom.xml`:
 <dependency>
   <groupId>net.pdfik</groupId>
   <artifactId>pdfik-client</artifactId>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
 </dependency>
 ```
 
@@ -34,7 +34,7 @@ Add the following dependency to your `pom.xml`:
 Add the following to your `build.gradle`:
 
 ```groovy
-implementation 'net.pdfik:pdfik-client:0.2.0'
+implementation 'net.pdfik:pdfik-client:0.3.0'
 ```
 
 ## Quick Start
@@ -105,11 +105,11 @@ public class Main {
         client.htmlToPdfAsync("<h1>Hello World</h1><p>Sent from Java Async SDK</p>")
                 .thenCompose(job -> {
                     System.out.println("Job created async: " + job.getJobId());
-                    return client.waitForJobAsync(job.getJobId(), Duration.ofSeconds(120), Duration.ofSeconds(2));
-                })
-                .thenCompose(status -> {
-                    System.out.println("Job complete. Downloading...");
-                    return client.downloadPdfAsync(status.getJobId());
+                    return client.waitForJobAsync(job.getJobId(), Duration.ofSeconds(120), Duration.ofSeconds(2))
+                            .thenCompose(status -> {
+                                System.out.println("Job complete. Downloading...");
+                                return client.downloadPdfAsync(job.getJobId());
+                            });
                 })
                 .thenAccept(pdfBytes -> {
                     System.out.println("Downloaded " + pdfBytes.length + " bytes.");
@@ -119,7 +119,8 @@ public class Main {
                     ex.printStackTrace();
                     client.close();
                     return null;
-                });
+                })
+                .join(); // wait: the SDK's threads are daemons, so main() must not return first
     }
 }
 ```
@@ -147,6 +148,60 @@ System.out.println(result.getExpiresAt()); // e.g. 2026-08-05T12:00:00Z
 byte[] pdfBytes = client.downloadPdf(job.getJobId()); // sample PDF
 ```
 
+### Markdown to PDF
+
+`markdownToPdf` converts Markdown (CommonMark + GFM tables and strikethrough) with a built-in print stylesheet. Raw HTML inside the Markdown is escaped, not rendered — use `htmlToPdf` for full HTML control. The same `PdfOptions` (paper format, margins, header/footer, watermark, ...) and job flow apply. The Markdown may be up to 100,000 characters (longer input is rejected with `422`); Markdown whose converted document is too large for the processing queue is rejected with `413` ([payload-too-large-for-queue](https://docs.pdfik.net/error-codes#payload-too-large-for-queue)) and is not charged. Example:
+
+```java
+// Simplest form
+JobCreatedResponse job = client.markdownToPdf("# Report\n\n| Item | Price |\n| --- | --- |\n| Render | $0.01 |");
+
+// Full control via the request object (+ optional Idempotency-Key)
+MarkdownToPdfRequest request = new MarkdownToPdfRequest("# Report\n\nHello **world**");
+request.setOptions(PdfOptions.builder().format(PaperFormat.A4).build());
+job = client.markdownToPdf(request, "report-2026-001");
+
+JobStatusResponse result = client.waitForJob(job.getJobId());
+byte[] pdfBytes = client.downloadPdf(job.getJobId());
+```
+
+### Screenshots
+
+`urlToImage` / `htmlToImage` capture a page as a PNG (default) or JPEG instead of a PDF. `ImageOptions`: `format` (`"png"` | `"jpeg"`), `fullPage` (default `false` - the visible area only; with `true` the height follows the real page and is clipped at 8,192 px, which is a ceiling and not a target, so a 2,000 px page still gives a 2,000 px image, and horizontal overflow beyond the viewport width is never captured), `quality` (1-100, JPEG only) and `viewport` (`ImageViewport(width, height)`; you pick the window size and we capture exactly that - nothing is scaled or fitted - `width` 320-1920, `height` 320-8192, defaults to 1024x768). Polling is identical to the PDF endpoints, and `downloadPdf` returns the raw image bytes (`image/png` or `image/jpeg`, filename `{jobId}.png`/`.jpg`):
+
+```java
+UrlToImageRequest request = new UrlToImageRequest("https://example.com");
+request.setOptions(ImageOptions.builder()
+        .format("jpeg")
+        .quality(80)
+        .fullPage(true)
+        .viewport(new ImageViewport(1280, 720))
+        .build());
+JobCreatedResponse job = client.urlToImage(request);
+
+client.waitForJob(job.getJobId());
+byte[] imageBytes = client.downloadPdf(job.getJobId()); // JPEG bytes
+
+JobCreatedResponse shot = client.htmlToImage("<h1>Hello</h1>"); // 1024x768 PNG
+```
+
+`UrlToImageRequest` also accepts the Pro+ `auth` option (basic/bearer), exactly as `urlToPdf`. Passing `quality` together with PNG is rejected with `422`. Async variants: `markdownToPdfAsync`, `urlToImageAsync`, `htmlToImageAsync`.
+
+### Deliver to your own bucket (BYOB)
+
+Set `delivery` (Pro+, on every request object — `UrlToPdfRequest`, `HtmlToPdfRequest`, `MarkdownToPdfRequest`, `UrlToImageRequest`, `HtmlToImageRequest`, `EInvoiceToPdfRequest`) and the output is uploaded straight to your own bucket via a presigned PUT URL; nothing is stored on PDFik's side. The URL must be `https` on the standard port 443 (any other port is rejected with `422`); presign it for at least 15 minutes and without a Content-Type condition:
+
+```java
+UrlToPdfRequest request = new UrlToPdfRequest();
+request.setUrl("https://example.com");
+request.setDelivery(new DeliveryOptions(presignedPutUrl)); // mode "presigned_put" is the only mode
+JobCreatedResponse job = client.urlToPdf(request);
+
+client.waitForJob(job.getJobId()); // "done" means the PUT to your bucket succeeded
+```
+
+Once a delivered job is done, the `job.finished` webhook reports the outcome only: it carries neither `file_url` nor `expires_at`, because PDFik keeps no copy and never records where the file went (the presigned URL is a credential, so it is used once and forgotten). You already know the destination — you signed it. `downloadPdf` answers `404` ([output-delivered-externally](https://docs.pdfik.net/error-codes#output-delivered-externally)) — the file only exists in your bucket. `delivery` cannot be combined with test mode (`400`).
+
 ### Factur-X e-invoices
 
 PDFik can produce hybrid e-invoices (Factur-X / ZUGFeRD): a PDF/A-3 file with your UN/CEFACT Cross-Industry-Invoice XML embedded as `factur-x.xml`. Two ways to get one:
@@ -159,7 +214,7 @@ JobCreatedResponse job = client.einvoiceToPdf(ciiXml);
 
 // Full control via the request class (+ optional Idempotency-Key)
 EInvoiceToPdfRequest request = new EInvoiceToPdfRequest(ciiXml);
-request.setProfile("extended");   // minimum | basicwl | basic | en16931 | extended
+request.setProfile("en16931");    // must match the XML's guideline ID: minimum | basicwl | basic | en16931 | extended
 request.setTemplateId("tpl_..."); // saved dashboard template; mutually exclusive with setTemplate(...)
 job = client.einvoiceToPdf(request, "invoice-2026-001");
 
