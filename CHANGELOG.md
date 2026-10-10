@@ -4,6 +4,24 @@ All notable changes to `net.pdfik:pdfik-client` are documented here. The format 
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] — 2026-10-10
+
+A documentation-only release: no API or behaviour change in the client. Everything below
+is what changed in the SDK after 0.3.0 was published, according to git.
+
+### Changed
+- BYOB `delivery` is available on every plan since 2026-10-09 (a change on the API side,
+  no client code change; it used to be Pro+). Free and Starter no longer get
+  `402 PLAN_UPGRADE_REQUIRED` with `feature: "delivery"`, which the 0.3.0 notes below
+  still describe as it was then.
+- README, "Deliver to your own bucket (BYOB)": `delivery` is marked "every plan" instead
+  of "Pro+".
+- Javadoc: `DeliveryOptions` and the `delivery` field of `UrlToPdfRequest`,
+  `HtmlToPdfRequest` and `EInvoiceToPdfRequest` say "every plan" instead of "Pro+"; the
+  class comments of `MarkdownToPdfRequest`, `UrlToImageRequest` and `HtmlToImageRequest`
+  no longer mark `delivery` as Pro+. `auth` is still Pro+.
+- Version `0.3.0` → `0.3.1` (`pom.xml`, `build.gradle`, README coordinates).
+
 ## [0.3.0] — 2026-09-19
 
 The screenshots + Markdown + BYOB delivery release.

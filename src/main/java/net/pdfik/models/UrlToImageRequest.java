@@ -9,7 +9,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  * {@code image/jpeg} bytes (filename {@code {jobId}.png}/{@code .jpg}).
  *
  * <p>{@code auth} (Pro+) attaches basic/bearer credentials exactly as on
- * {@code urlToPdf}. {@code delivery} (Pro+) uploads the output straight to
+ * {@code urlToPdf}. {@code delivery} uploads the output straight to
  * your own bucket via a presigned PUT URL; {@code test} runs the full
  * pipeline without real rendering. The two cannot be combined.</p>
  */

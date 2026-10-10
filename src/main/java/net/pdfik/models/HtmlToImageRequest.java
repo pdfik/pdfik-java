@@ -8,7 +8,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  * endpoints; the download returns the raw {@code image/png} or
  * {@code image/jpeg} bytes (filename {@code {jobId}.png}/{@code .jpg}).
  *
- * <p>{@code delivery} (Pro+) uploads the output straight to your own bucket
+ * <p>{@code delivery} uploads the output straight to your own bucket
  * via a presigned PUT URL; {@code test} runs the full pipeline without real
  * rendering. The two cannot be combined.</p>
  */

@@ -3,7 +3,7 @@ package net.pdfik.models;
 import com.fasterxml.jackson.annotation.JsonInclude;
 
 /**
- * BYOB delivery (Pro+): the rendered output is uploaded straight to your own
+ * BYOB delivery (every plan): the rendered output is uploaded straight to your own
  * bucket via a presigned PUT URL; nothing is stored on PDFik's side.
  *
  * <p>Presign for at least 15 minutes and without a Content-Type condition

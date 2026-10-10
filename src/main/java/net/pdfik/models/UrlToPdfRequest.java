@@ -10,7 +10,7 @@ public class UrlToPdfRequest {
     private JobAuthOptions auth;
     private EInvoiceOptions einvoice;
     /**
-     * BYOB delivery (Pro+): upload the output straight to your own bucket via
+     * BYOB delivery (every plan): upload the output straight to your own bucket via
      * a presigned PUT URL. Omitted from the request body when null. Not
      * combinable with test mode.
      */

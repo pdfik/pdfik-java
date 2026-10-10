@@ -10,7 +10,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  *
  * <p>{@code options} (paper format, margins, header/footer, watermark, ...)
  * works exactly as on {@code htmlToPdf}; job polling and download are
- * identical to the other PDF endpoints. {@code delivery} (Pro+) uploads the
+ * identical to the other PDF endpoints. {@code delivery} uploads the
  * output straight to your own bucket via a presigned PUT URL; {@code test}
  * runs the full pipeline without real rendering. The two cannot be
  * combined.</p>

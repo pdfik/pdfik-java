@@ -1,6 +1,6 @@
 # pdfik-client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-09-22).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-10).
 > Releases to Maven Central are cut from the monorepo; issues and PRs are welcome here.
 
 Official Java SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
@@ -25,7 +25,7 @@ Add the following dependency to your `pom.xml`:
 <dependency>
   <groupId>net.pdfik</groupId>
   <artifactId>pdfik-client</artifactId>
-  <version>0.3.0</version>
+  <version>0.3.1</version>
 </dependency>
 ```
 
@@ -34,7 +34,7 @@ Add the following dependency to your `pom.xml`:
 Add the following to your `build.gradle`:
 
 ```groovy
-implementation 'net.pdfik:pdfik-client:0.3.0'
+implementation 'net.pdfik:pdfik-client:0.3.1'
 ```
 
 ## Quick Start
@@ -189,7 +189,7 @@ JobCreatedResponse shot = client.htmlToImage("<h1>Hello</h1>"); // 1024x768 PNG
 
 ### Deliver to your own bucket (BYOB)
 
-Set `delivery` (Pro+, on every request object — `UrlToPdfRequest`, `HtmlToPdfRequest`, `MarkdownToPdfRequest`, `UrlToImageRequest`, `HtmlToImageRequest`, `EInvoiceToPdfRequest`) and the output is uploaded straight to your own bucket via a presigned PUT URL; nothing is stored on PDFik's side. The URL must be `https` on the standard port 443 (any other port is rejected with `422`); presign it for at least 15 minutes and without a Content-Type condition:
+Set `delivery` (every plan, on every request object — `UrlToPdfRequest`, `HtmlToPdfRequest`, `MarkdownToPdfRequest`, `UrlToImageRequest`, `HtmlToImageRequest`, `EInvoiceToPdfRequest`) and the output is uploaded straight to your own bucket via a presigned PUT URL; nothing is stored on PDFik's side. The URL must be `https` on the standard port 443 (any other port is rejected with `422`); presign it for at least 15 minutes and without a Content-Type condition:
 
 ```java
 UrlToPdfRequest request = new UrlToPdfRequest();
