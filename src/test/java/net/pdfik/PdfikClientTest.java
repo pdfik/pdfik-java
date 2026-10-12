@@ -1,18 +1,38 @@
 package net.pdfik;
 
 import com.github.tomakehurst.wiremock.WireMockServer;
+import com.github.tomakehurst.wiremock.client.MappingBuilder;
+import com.github.tomakehurst.wiremock.client.ResponseDefinitionBuilder;
+import com.github.tomakehurst.wiremock.client.ScenarioMappingBuilder;
 import com.github.tomakehurst.wiremock.core.WireMockConfiguration;
+import com.github.tomakehurst.wiremock.http.Fault;
+import com.github.tomakehurst.wiremock.matching.RequestPatternBuilder;
+import com.github.tomakehurst.wiremock.stubbing.Scenario;
 import net.pdfik.models.*;
 import org.junit.jupiter.api.*;
 
 import java.time.Duration;
+import java.util.HashSet;
+import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 import static com.github.tomakehurst.wiremock.client.WireMock.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 public class PdfikClientTest {
+    // The rate limiter's own body: no `type`, the wait in `retry_after_seconds`.
+    private static final String RATE_LIMITED = "{\"error\":\"RATE_LIMIT_EXCEEDED\",\"detail\":\"Too many requests. Please try again later.\",\"retry_after_seconds\":%d}";
+    private static final String JOB_QUEUED = "{\"job_id\":\"job-throttled\",\"status\":\"queued\",\"detail\":\"Job queued\"}";
+    // The download's body while another stream of the same file is open: the wait is in
+    // the Retry-After header only.
+    private static final String DOWNLOAD_BUSY = "{\"type\":\"https://docs.pdfik.net/error-codes#download-busy\",\"title\":\"Too Many Requests - Download In Progress\",\"status\":429,\"error\":\"DOWNLOAD_BUSY\",\"detail\":\"Another download of this file is already in progress. Only one active stream per file is allowed; this rejection does not consume a download attempt.\"}";
+    private static final String UUID_V4 = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+
     private static WireMockServer wireMockServer;
     private PdfikClient client;
 
@@ -45,6 +65,72 @@ public class PdfikClientTest {
         if (client != null) {
             client.close();
         }
+    }
+
+    /** Fakes the client's time: every wait returns at once and is recorded, in milliseconds. */
+    private List<Long> recordWaits() {
+        List<Long> waits = new CopyOnWriteArrayList<>();
+        client.sleeper = millis -> waits.add(millis);
+        client.delayer = (task, millis) -> {
+            waits.add(millis);
+            task.run();
+        };
+        return waits;
+    }
+
+    /** Answers successive requests to one endpoint with the given responses, in order; the last one repeats. */
+    private void stubInOrder(Supplier<MappingBuilder> request, ResponseDefinitionBuilder... responses) {
+        String scenario = "in-order-" + UUID.randomUUID();
+        for (int i = 0; i < responses.length; i++) {
+            ScenarioMappingBuilder stub = request.get().inScenario(scenario)
+                    .whenScenarioStateIs(i == 0 ? Scenario.STARTED : "step-" + i)
+                    .willReturn(responses[i]);
+            if (i < responses.length - 1) {
+                stub = stub.willSetStateTo("step-" + (i + 1));
+            }
+            wireMockServer.stubFor(stub);
+        }
+    }
+
+    private static ResponseDefinitionBuilder rateLimited(int retryAfterSeconds) {
+        return aResponse().withStatus(429)
+                .withHeader("Content-Type", "application/json")
+                .withHeader("Retry-After", String.valueOf(retryAfterSeconds))
+                .withBody(String.format(RATE_LIMITED, retryAfterSeconds));
+    }
+
+    private static ResponseDefinitionBuilder jobQueued() {
+        return aResponse().withStatus(202).withHeader("Content-Type", "application/json").withBody(JOB_QUEUED);
+    }
+
+    private static ResponseDefinitionBuilder jobDone() {
+        return aResponse().withStatus(200).withHeader("Content-Type", "application/json").withBody("{\"status\":\"done\"}");
+    }
+
+    private static ResponseDefinitionBuilder downloadBusy(String body) {
+        return aResponse().withStatus(429)
+                .withHeader("Content-Type", "application/json")
+                .withHeader("Retry-After", "10")
+                .withBody(body);
+    }
+
+    private static ResponseDefinitionBuilder pdf(byte[] bytes) {
+        return aResponse().withStatus(200).withHeader("Content-Type", "application/pdf").withBody(bytes);
+    }
+
+    /** The Idempotency-Key of every request that matched; {@code null} where the header was absent. */
+    private List<String> idempotencyKeys(RequestPatternBuilder requests) {
+        return wireMockServer.findAll(requests).stream()
+                .map(request -> request.getHeader("Idempotency-Key"))
+                .collect(Collectors.toList());
+    }
+
+    /** That many requests were sent, all under one key, and the client generated it. */
+    private static void assertOneGeneratedKey(List<String> keys, int requests) {
+        assertEquals(requests, keys.size());
+        assertNotNull(keys.get(0));
+        assertTrue(keys.get(0).matches(UUID_V4), keys.get(0));
+        assertEquals(1, new HashSet<>(keys).size(), keys.toString());
     }
 
     @Test
@@ -486,9 +572,40 @@ public class PdfikClientTest {
                 .willSetStateTo("done"));
         wireMockServer.stubFor(get(urlEqualTo("/jobs/job-429")).inScenario("Throttle").whenScenarioStateIs("done")
                 .willReturn(aResponse().withStatus(200).withHeader("Content-Type", "application/json").withBody("{\"status\":\"done\"}")));
+        List<Long> waits = recordWaits();
 
         JobStatusResponse result = client.waitForJob("job-429", java.time.Duration.ofSeconds(60), java.time.Duration.ofMillis(10));
         assertEquals(JobStatus.DONE, result.getStatus());
+        // One wait of the stated length per 429, and no request-level backoff on top.
+        assertEquals(List.of(1000L, 1000L, 1000L), waits);
+        wireMockServer.verify(4, getRequestedFor(urlEqualTo("/jobs/job-429")));
+    }
+
+    @Test
+    public void testWaitForJob429PastTheTimeoutEndsTheWait() {
+        // The polling loop waits out a 429 itself, so its own timeout applies: were the
+        // request path waiting too, this would be six requests and five waits.
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-late")).willReturn(rateLimited(30)));
+        List<Long> waits = recordWaits();
+
+        PdfikException exception = assertThrows(PdfikException.class,
+                () -> client.waitForJob("job-late", Duration.ZERO, Duration.ofMillis(10)));
+
+        assertEquals(408, exception.getStatusCode());
+        assertEquals("TIMEOUT", exception.getErrorCode());
+        assertTrue(waits.isEmpty());
+        wireMockServer.verify(1, getRequestedFor(urlEqualTo("/jobs/job-late")));
+    }
+
+    @Test
+    public void testWaitForJobAsyncWaitsOutA429() throws Exception {
+        stubInOrder(() -> get(urlEqualTo("/jobs/job-429-async")), rateLimited(1), rateLimited(1), rateLimited(1), jobDone());
+        List<Long> waits = recordWaits();
+
+        JobStatusResponse result = client.waitForJobAsync("job-429-async", Duration.ofSeconds(60), Duration.ofMillis(10)).get();
+        assertEquals(JobStatus.DONE, result.getStatus());
+        assertEquals(List.of(1000L, 1000L, 1000L), waits);
+        wireMockServer.verify(4, getRequestedFor(urlEqualTo("/jobs/job-429-async")));
     }
 
     @Test
@@ -499,6 +616,122 @@ public class PdfikClientTest {
         JobCreatedResponse job = client.markdownToPdfAsync(new MarkdownToPdfRequest("# Hi"), "md-key-1").get();
         assertEquals("job-md", job.getJobId());
         wireMockServer.verify(postRequestedFor(urlEqualTo("/markdown-to-pdf")).withHeader("Idempotency-Key", equalTo("md-key-1")));
+    }
+
+    @Test
+    public void testCreateWithoutAKeySendsOneGeneratedKeyAcrossA500Resend() {
+        // The first POST may have created the job before the 500 reached the client: a
+        // resend under another key, or under none, would be a second job, charged again.
+        stubInOrder(() -> post(urlEqualTo("/url-to-pdf")),
+                aResponse().withStatus(500).withBody("Internal Server Error"),
+                jobQueued());
+        recordWaits();
+
+        assertEquals("job-throttled", client.urlToPdf("https://example.com").getJobId());
+
+        assertOneGeneratedKey(idempotencyKeys(postRequestedFor(urlEqualTo("/url-to-pdf"))), 2);
+    }
+
+    @Test
+    public void testCreateKeepsItsGeneratedKeyAcrossAThrottleWait() {
+        stubInOrder(() -> post(urlEqualTo("/html-to-pdf")), rateLimited(4), jobQueued());
+        List<Long> waits = recordWaits();
+
+        assertEquals("job-throttled", client.htmlToPdf("<h1>Hello</h1>").getJobId());
+
+        assertEquals(List.of(4000L), waits);
+        assertOneGeneratedKey(idempotencyKeys(postRequestedFor(urlEqualTo("/html-to-pdf"))), 2);
+    }
+
+    @Test
+    public void testAsyncCreateKeepsItsGeneratedKeyAcrossA500AndAThrottleWait() throws Exception {
+        stubInOrder(() -> post(urlEqualTo("/url-to-image")),
+                aResponse().withStatus(500).withBody("Internal Server Error"),
+                rateLimited(4),
+                jobQueued());
+        List<Long> waits = recordWaits();
+
+        assertEquals("job-throttled", client.urlToImageAsync("https://example.com").get().getJobId());
+
+        assertEquals(List.of(1000L, 4000L), waits);
+        assertOneGeneratedKey(idempotencyKeys(postRequestedFor(urlEqualTo("/url-to-image"))), 3);
+    }
+
+    @Test
+    public void testSeparateCreateCallsUseDifferentKeys() {
+        wireMockServer.stubFor(post(urlEqualTo("/html-to-pdf")).willReturn(jobQueued()));
+
+        client.htmlToPdf("<h1>Hello</h1>");
+        client.htmlToPdf("<h1>Hello</h1>");
+
+        List<String> keys = idempotencyKeys(postRequestedFor(urlEqualTo("/html-to-pdf")));
+        assertEquals(2, keys.size());
+        assertNotNull(keys.get(0));
+        assertNotEquals(keys.get(0), keys.get(1));
+    }
+
+    @Test
+    public void testEveryCreateMethodSendsItsOwnGeneratedKey() throws Exception {
+        wireMockServer.stubFor(post(anyUrl()).willReturn(jobQueued()));
+
+        client.urlToPdf("https://example.com");
+        client.htmlToPdf("<h1>Hello</h1>");
+        client.markdownToPdf("# Hi");
+        client.urlToImage("https://example.com");
+        client.htmlToImage("<h1>Hello</h1>");
+        client.einvoiceToPdf("<rsm:CrossIndustryInvoice/>");
+        client.urlToPdfAsync("https://example.com").get();
+        client.htmlToPdfAsync("<h1>Hello</h1>").get();
+        client.markdownToPdfAsync("# Hi").get();
+        client.urlToImageAsync("https://example.com").get();
+        client.htmlToImageAsync("<h1>Hello</h1>").get();
+        client.einvoiceToPdfAsync("<rsm:CrossIndustryInvoice/>").get();
+
+        List<String> keys = idempotencyKeys(postRequestedFor(anyUrl()));
+        assertEquals(12, keys.size());
+        for (String key : keys) {
+            assertNotNull(key);
+            assertTrue(key.matches(UUID_V4), key);
+        }
+        assertEquals(12, new HashSet<>(keys).size(), keys.toString());
+        for (String path : List.of("/url-to-pdf", "/html-to-pdf", "/markdown-to-pdf", "/url-to-image", "/html-to-image", "/einvoice-to-pdf")) {
+            wireMockServer.verify(2, postRequestedFor(urlEqualTo(path)));
+        }
+    }
+
+    @Test
+    public void testCallerSuppliedKeyIsSentUnchangedOnEveryAttempt() throws Exception {
+        stubInOrder(() -> post(urlEqualTo("/markdown-to-pdf")),
+                aResponse().withStatus(500).withBody("Internal Server Error"),
+                rateLimited(1),
+                jobQueued());
+        stubInOrder(() -> post(urlEqualTo("/einvoice-to-pdf")),
+                aResponse().withStatus(500).withBody("Internal Server Error"),
+                rateLimited(1),
+                jobQueued());
+        recordWaits();
+
+        client.markdownToPdf(new MarkdownToPdfRequest("# Hi"), "order-42:md.1_a");
+        client.einvoiceToPdfAsync(new EInvoiceToPdfRequest("<rsm:CrossIndustryInvoice/>"), "order-42:einv.1_a").get();
+
+        assertEquals(List.of("order-42:md.1_a", "order-42:md.1_a", "order-42:md.1_a"),
+                idempotencyKeys(postRequestedFor(urlEqualTo("/markdown-to-pdf"))));
+        assertEquals(List.of("order-42:einv.1_a", "order-42:einv.1_a", "order-42:einv.1_a"),
+                idempotencyKeys(postRequestedFor(urlEqualTo("/einvoice-to-pdf"))));
+    }
+
+    @Test
+    public void testStatusAndDownloadRequestsCarryNoIdempotencyKey() throws Exception {
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-plain")).willReturn(jobDone()));
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-plain/download")).willReturn(pdf(new byte[]{0, 1, 2, 3, 4})));
+
+        client.getJob("job-plain");
+        client.downloadPdf("job-plain");
+        client.getJobAsync("job-plain").get();
+        client.downloadPdfAsync("job-plain").get();
+
+        wireMockServer.verify(2, getRequestedFor(urlEqualTo("/jobs/job-plain")).withoutHeader("Idempotency-Key"));
+        wireMockServer.verify(2, getRequestedFor(urlEqualTo("/jobs/job-plain/download")).withoutHeader("Idempotency-Key"));
     }
 
     @Test
@@ -540,9 +773,8 @@ public class PdfikClientTest {
                         .withStatus(502)
                         .withBody("Bad Gateway")));
 
-        // Set connect timeout very short for fast test, and baseUrl points to wiremock
-        // The retry will take 1s -> 2s (total 3s). To make tests faster, we accept it or we can stub retry delay.
-        // Let's run it, 3s is acceptable in tests.
+        List<Long> waits = recordWaits();
+
         PdfikException exception = assertThrows(PdfikException.class, () -> {
             client.getJob("job-123");
         });
@@ -550,6 +782,32 @@ public class PdfikClientTest {
         assertEquals(502, exception.getStatusCode());
         // Verify 3 requests were sent
         wireMockServer.verify(3, getRequestedFor(urlEqualTo("/jobs/job-123")));
+        assertEquals(List.of(1000L, 2000L), waits);
+    }
+
+    @Test
+    public void testRetryOn500ThenSuccessKeepsTheBackoff() {
+        stubInOrder(() -> get(urlEqualTo("/jobs/job-5xx")),
+                aResponse().withStatus(500).withBody("Internal Server Error"),
+                jobDone());
+        List<Long> waits = recordWaits();
+
+        assertEquals(JobStatus.DONE, client.getJob("job-5xx").getStatus());
+        assertEquals(List.of(1000L), waits);
+        wireMockServer.verify(2, getRequestedFor(urlEqualTo("/jobs/job-5xx")));
+    }
+
+    @Test
+    public void testAsyncRetryOn500ThenSuccessKeepsTheBackoff() throws Exception {
+        stubInOrder(() -> get(urlEqualTo("/jobs/job-5xx-async")),
+                aResponse().withStatus(500).withBody("Internal Server Error"),
+                aResponse().withStatus(503).withBody("Service Unavailable"),
+                jobDone());
+        List<Long> waits = recordWaits();
+
+        assertEquals(JobStatus.DONE, client.getJobAsync("job-5xx-async").get().getStatus());
+        assertEquals(List.of(1000L, 2000L), waits);
+        wireMockServer.verify(3, getRequestedFor(urlEqualTo("/jobs/job-5xx-async")));
     }
 
     @Test
@@ -557,9 +815,7 @@ public class PdfikClientTest {
         wireMockServer.stubFor(get(urlEqualTo("/jobs/job-123"))
                 .inScenario("RetryRateLimit")
                 .whenScenarioStateIs(com.github.tomakehurst.wiremock.stubbing.Scenario.STARTED)
-                .willReturn(aResponse()
-                        .withStatus(429)
-                        .withBody("Rate limit exceeded"))
+                .willReturn(rateLimited(6))
                 .willSetStateTo("SuccessCall"));
 
         wireMockServer.stubFor(get(urlEqualTo("/jobs/job-123"))
@@ -569,11 +825,317 @@ public class PdfikClientTest {
                         .withStatus(200)
                         .withHeader("Content-Type", "application/json")
                         .withBody("{\"status\":\"done\"}")));
+        List<Long> waits = recordWaits();
 
         JobStatusResponse response = client.getJob("job-123");
         assertNotNull(response);
         assertEquals(JobStatus.DONE, response.getStatus());
         wireMockServer.verify(2, getRequestedFor(urlEqualTo("/jobs/job-123")));
+        assertEquals(List.of(6000L), waits);
+    }
+
+    @Test
+    public void testDownloadWaitsOutAThrottle429() {
+        // Found on production with a Free key (10 requests/min): create and poll filled the
+        // window, and the download then spent its three attempts within three seconds.
+        byte[] fakePdf = new byte[]{0, 1, 2, 3, 4};
+        stubInOrder(() -> get(urlEqualTo("/jobs/job-dl/download")),
+                rateLimited(7),
+                rateLimited(3),
+                aResponse().withStatus(200).withHeader("Content-Type", "application/pdf").withBody(fakePdf));
+        List<Long> waits = recordWaits();
+
+        assertArrayEquals(fakePdf, client.downloadPdf("job-dl"));
+        assertEquals(List.of(7000L, 3000L), waits);
+        wireMockServer.verify(3, getRequestedFor(urlEqualTo("/jobs/job-dl/download")));
+    }
+
+    @Test
+    public void testAsyncDownloadWaitsOutAThrottle429() throws Exception {
+        byte[] fakePdf = new byte[]{0, 1, 2, 3, 4};
+        stubInOrder(() -> get(urlEqualTo("/jobs/job-dl-async/download")),
+                rateLimited(7),
+                rateLimited(3),
+                aResponse().withStatus(200).withHeader("Content-Type", "application/pdf").withBody(fakePdf));
+        List<Long> waits = recordWaits();
+
+        assertArrayEquals(fakePdf, client.downloadPdfAsync("job-dl-async").get());
+        assertEquals(List.of(7000L, 3000L), waits);
+        wireMockServer.verify(3, getRequestedFor(urlEqualTo("/jobs/job-dl-async/download")));
+    }
+
+    @Test
+    public void testCreateWaitsOutAThrottle429() {
+        stubInOrder(() -> post(urlEqualTo("/url-to-pdf")), rateLimited(4), rateLimited(2), jobQueued());
+        List<Long> waits = recordWaits();
+
+        assertEquals("job-throttled", client.urlToPdf("https://example.com").getJobId());
+        assertEquals(List.of(4000L, 2000L), waits);
+        wireMockServer.verify(3, postRequestedFor(urlEqualTo("/url-to-pdf")));
+    }
+
+    @Test
+    public void testAsyncCreateWaitsOutAThrottle429() throws Exception {
+        stubInOrder(() -> post(urlEqualTo("/url-to-image")), rateLimited(4), rateLimited(2), jobQueued());
+        List<Long> waits = recordWaits();
+
+        assertEquals("job-throttled", client.urlToImageAsync("https://example.com").get().getJobId());
+        assertEquals(List.of(4000L, 2000L), waits);
+        wireMockServer.verify(3, postRequestedFor(urlEqualTo("/url-to-image")));
+    }
+
+    @Test
+    public void testConcurrencyLimit429IsWaitedOut() {
+        // The in-flight job cap states its wait in the Retry-After header only.
+        stubInOrder(() -> post(urlEqualTo("/markdown-to-pdf")),
+                aResponse().withStatus(429)
+                        .withHeader("Content-Type", "application/json")
+                        .withHeader("Retry-After", "5")
+                        .withBody("{\"type\":\"https://docs.pdfik.net/error-codes#concurrency-limit\",\"title\":\"Too Many Requests - Concurrency Limit\",\"status\":429,\"error\":\"CONCURRENCY_LIMIT_EXCEEDED\",\"detail\":\"You already have 3 jobs queued or rendering; plan 'free' allows 3 at a time. Poll your pending jobs and retry.\",\"plan\":\"free\",\"limit\":3,\"in_flight\":3}"),
+                jobQueued());
+        List<Long> waits = recordWaits();
+
+        assertEquals("job-throttled", client.markdownToPdf("# Hi").getJobId());
+        assertEquals(List.of(5000L), waits);
+        wireMockServer.verify(2, postRequestedFor(urlEqualTo("/markdown-to-pdf")));
+    }
+
+    @Test
+    public void testThrottleWaitIsTheBodyValueThenTheHeaderThenTenSecondsAndIsCapped() {
+        String noHint = "{\"error\":\"RATE_LIMIT_EXCEEDED\",\"detail\":\"Too many requests. Please try again later.\"}";
+        stubInOrder(() -> get(urlEqualTo("/jobs/job-waits")),
+                aResponse().withStatus(429).withHeader("Retry-After", "30").withBody(String.format(RATE_LIMITED, 2)),
+                aResponse().withStatus(429).withHeader("Retry-After", "8").withBody(noHint),
+                aResponse().withStatus(429).withBody(noHint),
+                aResponse().withStatus(429).withBody(String.format(RATE_LIMITED, 3600)),
+                jobDone());
+        List<Long> waits = recordWaits();
+
+        assertEquals(JobStatus.DONE, client.getJob("job-waits").getStatus());
+        assertEquals(List.of(2000L, 8000L, 10000L, 60000L), waits);
+    }
+
+    @Test
+    public void testThrottle429ThatNeverClearsIsRaisedAfterTheAllowedWaits() {
+        wireMockServer.stubFor(post(urlEqualTo("/html-to-pdf")).willReturn(rateLimited(2)));
+        List<Long> waits = recordWaits();
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> client.htmlToPdf("<h1>Hello</h1>"));
+
+        assertEquals(429, exception.getStatusCode());
+        assertEquals("RATE_LIMIT_EXCEEDED", exception.getErrorCode());
+        assertEquals("Too many requests. Please try again later.", exception.getMessage());
+        assertEquals(List.of(2000L, 2000L, 2000L, 2000L, 2000L), waits);
+        wireMockServer.verify(6, postRequestedFor(urlEqualTo("/html-to-pdf")));
+    }
+
+    // A broken connection after a throttle wait: three attempts in all, as in the
+    // synchronous client. The levels of the async chain used to retry on top of one
+    // another here (five sends after one wait, thirteen after five).
+    @Test
+    public void testAsyncBrokenConnectionAfterAThrottleWaitMakesThreeAttempts() {
+        stubInOrder(() -> post(urlEqualTo("/html-to-pdf")),
+                rateLimited(2),
+                aResponse().withFault(Fault.EMPTY_RESPONSE));
+        List<Long> waits = recordWaits();
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () -> client.htmlToPdfAsync("<h1>Hi</h1>").get());
+
+        Throwable cause = failure.getCause();
+        while (!(cause instanceof PdfikException) && cause.getCause() != null) {
+            cause = cause.getCause();
+        }
+        assertTrue(cause instanceof PdfikException);
+        assertEquals(503, ((PdfikException) cause).getStatusCode());
+        assertEquals(List.of(2000L, 1000L, 2000L), waits);
+        wireMockServer.verify(4, postRequestedFor(urlEqualTo("/html-to-pdf")));
+    }
+
+    @Test
+    public void testAsyncThrottle429ThatNeverClearsIsRaisedAfterTheAllowedWaits() {
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-stuck/download")).willReturn(rateLimited(2)));
+        List<Long> waits = recordWaits();
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () -> client.downloadPdfAsync("job-stuck").get());
+
+        assertTrue(failure.getCause() instanceof PdfikException);
+        PdfikException exception = (PdfikException) failure.getCause();
+        assertEquals(429, exception.getStatusCode());
+        assertEquals("RATE_LIMIT_EXCEEDED", exception.getErrorCode());
+        assertEquals(List.of(2000L, 2000L, 2000L, 2000L, 2000L), waits);
+        wireMockServer.verify(6, getRequestedFor(urlEqualTo("/jobs/job-stuck/download")));
+    }
+
+    @Test
+    public void testQuota429OnCreateIsRaisedAtOnce() {
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-pdf"))
+                .willReturn(aResponse().withStatus(429)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"type\":\"https://docs.pdfik.net/error-codes#quota-bytes-exceeded\",\"title\":\"Too Many Requests - Byte Quota Exceeded\",\"status\":429,\"error\":\"BYTE_QUOTA_EXCEEDED\",\"detail\":\"Monthly generated-data quota of 536870912 bytes for plan 'free' exceeded (536870999 bytes used this billing window).\",\"plan\":\"free\",\"limit\":536870912,\"used\":536870999}")));
+        List<Long> waits = recordWaits();
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> client.urlToPdf("https://example.com"));
+
+        assertEquals(429, exception.getStatusCode());
+        assertEquals("BYTE_QUOTA_EXCEEDED", exception.getErrorCode());
+        assertTrue(waits.isEmpty());
+        wireMockServer.verify(1, postRequestedFor(urlEqualTo("/url-to-pdf")));
+    }
+
+    @Test
+    public void testAsyncQuota429OnCreateIsRaisedAtOnce() {
+        wireMockServer.stubFor(post(urlEqualTo("/html-to-pdf"))
+                .willReturn(aResponse().withStatus(429)
+                        .withHeader("Content-Type", "application/json")
+                        .withBody("{\"type\":\"https://docs.pdfik.net/error-codes#quota-bytes-exceeded\",\"title\":\"Too Many Requests - Byte Quota Exceeded\",\"status\":429,\"error\":\"BYTE_QUOTA_EXCEEDED\",\"detail\":\"Monthly generated-data quota exceeded.\"}")));
+        List<Long> waits = recordWaits();
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () -> client.htmlToPdfAsync("<h1>Hello</h1>").get());
+
+        assertTrue(failure.getCause() instanceof PdfikException);
+        assertEquals("BYTE_QUOTA_EXCEEDED", ((PdfikException) failure.getCause()).getErrorCode());
+        assertTrue(waits.isEmpty());
+        wireMockServer.verify(1, postRequestedFor(urlEqualTo("/html-to-pdf")));
+    }
+
+    @Test
+    public void testOther429sAreRaisedAtOnce() {
+        // Each states a Retry-After the client must not act on: none of them clears by
+        // itself within a minute, and the last one is not the API's answer at all.
+        wireMockServer.stubFor(post(urlEqualTo("/html-to-pdf"))
+                .willReturn(aResponse().withStatus(429)
+                        .withHeader("Content-Type", "application/json")
+                        .withHeader("Retry-After", "37")
+                        .withBody("{\"type\":\"https://docs.pdfik.net/error-codes#test-rate-limit-exceeded\",\"title\":\"Too Many Requests - Test Mode Rate Limit\",\"status\":429,\"error\":\"TEST_RATE_LIMIT_EXCEEDED\",\"detail\":\"Test-mode submissions are free of quota but capped at 60 per minute per account. Retry after the window resets.\",\"limit\":60,\"window\":\"minute\"}")));
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-spent/download"))
+                .willReturn(aResponse().withStatus(429)
+                        .withHeader("Content-Type", "application/json")
+                        .withHeader("Retry-After", "3600")
+                        .withBody("{\"type\":\"https://docs.pdfik.net/error-codes#download-attempts-exhausted\",\"title\":\"Too Many Requests - Download Attempts Exhausted\",\"status\":429,\"detail\":\"This file has been downloaded the maximum of 3 times. Submit a new render or contact support.\"}")));
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-proxy"))
+                .willReturn(aResponse().withStatus(429).withHeader("Retry-After", "1").withBody("Rate limit exceeded")));
+        List<Long> waits = recordWaits();
+
+        PdfikException testCap = assertThrows(PdfikException.class, () -> client.htmlToPdf("<h1>Hello</h1>", true));
+        assertEquals(429, testCap.getStatusCode());
+        assertEquals("TEST_RATE_LIMIT_EXCEEDED", testCap.getErrorCode());
+
+        PdfikException spent = assertThrows(PdfikException.class, () -> client.downloadPdf("job-spent"));
+        assertEquals(429, spent.getStatusCode());
+        assertEquals("This file has been downloaded the maximum of 3 times. Submit a new render or contact support.", spent.getMessage());
+        assertTrue(spent.getResponseBody().contains("#download-attempts-exhausted"));
+
+        assertEquals(429, assertThrows(PdfikException.class, () -> client.getJob("job-proxy")).getStatusCode());
+
+        assertTrue(waits.isEmpty());
+        wireMockServer.verify(1, postRequestedFor(urlEqualTo("/html-to-pdf")));
+        wireMockServer.verify(1, getRequestedFor(urlEqualTo("/jobs/job-spent/download")));
+        wireMockServer.verify(1, getRequestedFor(urlEqualTo("/jobs/job-proxy")));
+    }
+
+    @Test
+    public void testDownloadWaitsOutABusyDownload() {
+        // Another stream of the same file is still open: it closes within seconds and the
+        // rejection costs no download attempt, so asking again is free.
+        byte[] fakePdf = new byte[]{0, 1, 2, 3, 4};
+        stubInOrder(() -> get(urlEqualTo("/jobs/job-busy/download")), downloadBusy(DOWNLOAD_BUSY), pdf(fakePdf));
+        List<Long> waits = recordWaits();
+
+        assertArrayEquals(fakePdf, client.downloadPdf("job-busy"));
+        assertEquals(List.of(10000L), waits);
+        wireMockServer.verify(2, getRequestedFor(urlEqualTo("/jobs/job-busy/download")));
+    }
+
+    @Test
+    public void testAsyncDownloadWaitsOutABusyDownload() throws Exception {
+        byte[] fakePdf = new byte[]{0, 1, 2, 3, 4};
+        stubInOrder(() -> get(urlEqualTo("/jobs/job-busy-async/download")), downloadBusy(DOWNLOAD_BUSY), pdf(fakePdf));
+        List<Long> waits = recordWaits();
+
+        assertArrayEquals(fakePdf, client.downloadPdfAsync("job-busy-async").get());
+        assertEquals(List.of(10000L), waits);
+        wireMockServer.verify(2, getRequestedFor(urlEqualTo("/jobs/job-busy-async/download")));
+    }
+
+    @Test
+    public void testBusyDownloadIsRecognisedByTheTypeAloneAndByTheErrorCodeAlone() {
+        // The API in production today sends the type URL and no `error`.
+        String typeOnly = "{\"type\":\"https://docs.pdfik.net/error-codes#download-busy\",\"title\":\"Too Many Requests - Download In Progress\",\"status\":429,\"detail\":\"Another download of this file is already in progress.\"}";
+        String codeOnly = "{\"error\":\"DOWNLOAD_BUSY\",\"detail\":\"Another download of this file is already in progress.\"}";
+        byte[] fakePdf = new byte[]{0, 1, 2, 3, 4};
+        stubInOrder(() -> get(urlEqualTo("/jobs/job-by-type/download")), downloadBusy(typeOnly), pdf(fakePdf));
+        stubInOrder(() -> get(urlEqualTo("/jobs/job-by-code/download")), downloadBusy(codeOnly), pdf(fakePdf));
+        List<Long> waits = recordWaits();
+
+        assertArrayEquals(fakePdf, client.downloadPdf("job-by-type"));
+        assertEquals(List.of(10000L), waits);
+        assertArrayEquals(fakePdf, client.downloadPdf("job-by-code"));
+        assertEquals(List.of(10000L, 10000L), waits);
+    }
+
+    @Test
+    public void testDownloadAttemptsExhaustedIsRaisedAtOnce() {
+        // The download's other 429. Its Retry-After is an hour and waiting cannot bring the
+        // attempts back, so neither the sync nor the async call waits or asks again.
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-used-up/download"))
+                .willReturn(aResponse().withStatus(429)
+                        .withHeader("Content-Type", "application/json")
+                        .withHeader("Retry-After", "3600")
+                        .withBody("{\"type\":\"https://docs.pdfik.net/error-codes#download-attempts-exhausted\",\"title\":\"Too Many Requests - Download Attempts Exhausted\",\"status\":429,\"error\":\"DOWNLOAD_ATTEMPTS_EXHAUSTED\",\"detail\":\"This file has been downloaded the maximum of 3 times. Submit a new render or contact support.\"}")));
+        List<Long> waits = recordWaits();
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> client.downloadPdf("job-used-up"));
+        assertEquals(429, exception.getStatusCode());
+        assertEquals("DOWNLOAD_ATTEMPTS_EXHAUSTED", exception.getErrorCode());
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () -> client.downloadPdfAsync("job-used-up").get());
+        assertTrue(failure.getCause() instanceof PdfikException);
+        assertEquals("DOWNLOAD_ATTEMPTS_EXHAUSTED", ((PdfikException) failure.getCause()).getErrorCode());
+
+        assertTrue(waits.isEmpty());
+        wireMockServer.verify(2, getRequestedFor(urlEqualTo("/jobs/job-used-up/download")));
+    }
+
+    @Test
+    public void testBusyDownloadThatNeverClearsIsRaisedAfterTheAllowedWaits() {
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-held/download")).willReturn(downloadBusy(DOWNLOAD_BUSY)));
+        List<Long> waits = recordWaits();
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> client.downloadPdf("job-held"));
+
+        assertEquals(429, exception.getStatusCode());
+        assertEquals("DOWNLOAD_BUSY", exception.getErrorCode());
+        assertEquals(List.of(10000L, 10000L, 10000L, 10000L, 10000L), waits);
+        wireMockServer.verify(6, getRequestedFor(urlEqualTo("/jobs/job-held/download")));
+    }
+
+    @Test
+    public void testAsyncBusyDownloadSharesItsWaitsWithTheRateLimit() {
+        // One allowance of waits per call, whatever the throttle: two rate-limit waits
+        // leave three for the busy download.
+        stubInOrder(() -> get(urlEqualTo("/jobs/job-held-async/download")),
+                rateLimited(2),
+                rateLimited(2),
+                downloadBusy(DOWNLOAD_BUSY));
+        List<Long> waits = recordWaits();
+
+        ExecutionException failure = assertThrows(ExecutionException.class, () -> client.downloadPdfAsync("job-held-async").get());
+
+        assertTrue(failure.getCause() instanceof PdfikException);
+        assertEquals("DOWNLOAD_BUSY", ((PdfikException) failure.getCause()).getErrorCode());
+        assertEquals(List.of(2000L, 2000L, 10000L, 10000L, 10000L), waits);
+        wireMockServer.verify(6, getRequestedFor(urlEqualTo("/jobs/job-held-async/download")));
+    }
+
+    @Test
+    public void testBusyDownloadIsWaitedOutOnTheDownloadOnly() {
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-not-a-download")).willReturn(downloadBusy(DOWNLOAD_BUSY)));
+        List<Long> waits = recordWaits();
+
+        assertEquals(429, assertThrows(PdfikException.class, () -> client.getJob("job-not-a-download")).getStatusCode());
+
+        assertTrue(waits.isEmpty());
+        wireMockServer.verify(1, getRequestedFor(urlEqualTo("/jobs/job-not-a-download")));
     }
 
     @Test

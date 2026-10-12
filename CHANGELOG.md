@@ -4,6 +4,50 @@ All notable changes to `net.pdfik:pdfik-client` are documented here. The format 
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.3.2] — 2026-10-12
+
+### Fixed
+- A retried create call can no longer produce a second job. Every create call —
+  `urlToPdf`, `htmlToPdf`, `markdownToPdf`, `urlToImage`, `htmlToImage`, `einvoiceToPdf`
+  and their async twins — now carries an `Idempotency-Key` header automatically: the key
+  you pass, or else a random UUID generated once per call and sent unchanged every time
+  that call is sent again (after a `5xx`, a network failure or a throttle wait). The API
+  answers a repeated key with the original job instead of creating a new one. Before, a
+  call made without a key was simply sent again, so when the first request had created
+  the job and only its answer was lost, you got two jobs and were charged twice. Status
+  and download requests do not carry the header.
+- A rate-limit `429` on a create call or on a download is now waited out the way it
+  already was while polling. Every request the client makes — `urlToPdf`, `htmlToPdf`,
+  `markdownToPdf`, `urlToImage`, `htmlToImage`, `einvoiceToPdf`, `getJob`, `downloadPdf`
+  and their async twins — sleeps for the time the API states (`retry_after_seconds`, else
+  the `Retry-After` header, else 10 s; capped at 60 s) and sends the request again, up to
+  5 waits per call; after that the `429` is thrown as before. The in-flight job cap
+  (`CONCURRENCY_LIMIT_EXCEEDED`) is waited out the same way. The client used to retry
+  three times within about three seconds and then throw, so on Free (10 requests/min) a
+  program that created a job, polled and then downloaded could fail at the download, or
+  at the create call, whenever the per-minute window was full.
+- A busy download is waited out. While another download of the same file is still
+  streaming, the API answers `429` `download-busy`; `downloadPdf` / `downloadPdfAsync` now
+  sleep for the `Retry-After` it states (10 s) and ask again, within the same 5 waits per
+  call. It clears by itself within seconds and costs no download attempt.
+- Quota `429`s are no longer retried. The monthly byte quota, the test-mode caps, an
+  exhausted download counter (`download-attempts-exhausted`) and any `429` the client does
+  not recognise are thrown at once, without a sleep: waiting cannot help there, and the
+  client used to spend three attempts on them.
+- `waitForJob` / `waitForJobAsync`: one `429` while polling now costs one wait. The
+  request used to be retried twice (after 1 s and 2 s) before the polling loop slept the
+  stated time, so every throttled poll spent three requests of the very limit it was
+  waiting for.
+- A failed `downloadPdf` / `downloadPdfAsync` now throws a `PdfikException` with the API's
+  message, `getErrorCode()` and the real response body. The error body of a download was
+  read as bytes and never decoded, so the message was always
+  `API request failed with status …` whatever the API had answered.
+
+### Changed
+- README: the retry line in "Features" and the downloads line in "Limits, retention and
+  error codes" say the above.
+- Version `0.3.1` → `0.3.2` (`pom.xml`, `build.gradle`, README coordinates).
+
 ## [0.3.1] — 2026-10-10
 
 A documentation-only release: no API or behaviour change in the client. Everything below

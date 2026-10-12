@@ -11,17 +11,49 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.*;
 import java.util.function.Supplier;
 
 public class PdfikClient implements AutoCloseable {
+    // A throttle (rate or in-flight limit) is waited out, not counted as a failed
+    // attempt — but not forever: after this many waits the 429 is raised.
+    static final int THROTTLE_WAITS = 5;
+    static final long RETRY_AFTER_FALLBACK_MS = 10_000L;
+    // The server states the wait; the cap keeps it from parking the caller.
+    static final long RETRY_AFTER_CAP_MS = 60_000L;
+
+    // The 429s that clear by themselves within a minute: the per-account request rate and
+    // the in-flight job cap. A quota 429, the test-mode caps and an exhausted download
+    // counter do not, so they are raised at once.
+    private static final List<String> THROTTLES = List.of("rate-limit-exceeded", "concurrency-limit-exceeded");
+    // The download has one more: another stream of the same file is still open. It clears
+    // within seconds and costs no download attempt.
+    private static final List<String> DOWNLOAD_THROTTLES = List.of("rate-limit-exceeded", "concurrency-limit-exceeded", "download-busy");
+
+    @FunctionalInterface
+    interface Sleeper {
+        void sleep(long millis) throws InterruptedException;
+    }
+
+    @FunctionalInterface
+    interface Delayer {
+        void schedule(Runnable task, long millis);
+    }
+
     private final String apiKey;
     private final String baseUrl;
     private final Duration requestTimeout;
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
     private final ScheduledExecutorService scheduler;
+
+    // Injectable time, so the retry and polling schedules are testable without sleeping.
+    Sleeper sleeper = Thread::sleep;
+    Delayer delayer;
 
     private PdfikClient(Builder builder) {
         if (builder.apiKey == null || builder.apiKey.trim().isEmpty()) {
@@ -46,6 +78,7 @@ public class PdfikClient implements AutoCloseable {
             t.setDaemon(true);
             return t;
         });
+        this.delayer = (task, millis) -> scheduler.schedule(task, millis, TimeUnit.MILLISECONDS);
     }
 
     public static Builder builder() {
@@ -55,17 +88,37 @@ public class PdfikClient implements AutoCloseable {
     private <T> HttpResponse<T> executeWithRetry(
             Supplier<HttpRequest> requestSupplier,
             HttpResponse.BodyHandler<T> responseBodyHandler) {
+        return executeWithRetry(requestSupplier, responseBodyHandler, THROTTLE_WAITS, THROTTLES);
+    }
+
+    private <T> HttpResponse<T> executeWithRetry(
+            Supplier<HttpRequest> requestSupplier,
+            HttpResponse.BodyHandler<T> responseBodyHandler,
+            int throttleWaits,
+            List<String> throttles) {
         int attempt = 0;
+        int throttled = 0;
         while (true) {
             attempt++;
             HttpRequest request = requestSupplier.get();
             try {
                 HttpResponse<T> response = httpClient.send(request, responseBodyHandler);
                 int status = response.statusCode();
-                if ((status >= 500 || status == 429) && attempt < 3) {
+                if (throttled < throttleWaits && isThrottled(response, throttles)) {
+                    throttled++;
+                    attempt--; // not a failed attempt
+                    try {
+                        sleeper.sleep(throttleDelayMs(response));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new PdfikException("Request interrupted during retry delay", status, null, null);
+                    }
+                    continue;
+                }
+                if (status >= 500 && attempt < 3) {
                     long delay = (long) (Math.pow(2, attempt - 1) * 1000);
                     try {
-                        Thread.sleep(delay);
+                        sleeper.sleep(delay);
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         throw new PdfikException("Request interrupted during retry delay", status, null, null);
@@ -77,7 +130,7 @@ public class PdfikClient implements AutoCloseable {
                 if (attempt < 3) {
                     long delay = (long) (Math.pow(2, attempt - 1) * 1000);
                     try {
-                        Thread.sleep(delay);
+                        sleeper.sleep(delay);
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                         throw new PdfikException("Request interrupted during retry delay", 503, null, null);
@@ -95,36 +148,35 @@ public class PdfikClient implements AutoCloseable {
     private <T> CompletableFuture<HttpResponse<T>> executeWithRetryAsync(
             Supplier<HttpRequest> requestSupplier,
             HttpResponse.BodyHandler<T> responseBodyHandler) {
-        return executeWithRetryAsync(requestSupplier, responseBodyHandler, 1);
+        return executeWithRetryAsync(requestSupplier, responseBodyHandler, 1, THROTTLE_WAITS, THROTTLES);
     }
 
     private <T> CompletableFuture<HttpResponse<T>> executeWithRetryAsync(
             Supplier<HttpRequest> requestSupplier,
             HttpResponse.BodyHandler<T> responseBodyHandler,
-            int attempt) {
+            int attempt,
+            int throttleWaits,
+            List<String> throttles) {
         HttpRequest request = requestSupplier.get();
         return httpClient.sendAsync(request, responseBodyHandler)
-                .thenCompose(response -> {
-                    int status = response.statusCode();
-                    if ((status >= 500 || status == 429) && attempt < 3) {
+                // handle() sits directly on the send, so every level deals with its OWN send
+                // only: a later attempt that has already given up is passed on as it is, not
+                // retried once more by each level above it. (Not exceptionallyCompose(): that
+                // is Java 12+, and this SDK promises Java 11.)
+                .<CompletableFuture<HttpResponse<T>>>handle((response, ex) -> {
+                    if (ex != null) {
+                        return retryAfterFailure(requestSupplier, responseBodyHandler, attempt, throttleWaits, throttles, ex);
+                    }
+                    if (throttleWaits > 0 && isThrottled(response, throttles)) {
+                        // Not a failed attempt: the attempt number stays, one wait is spent.
+                        return retryLater(requestSupplier, responseBodyHandler, attempt, throttleWaits - 1, throttles, throttleDelayMs(response));
+                    }
+                    if (response.statusCode() >= 500 && attempt < 3) {
                         long delay = (long) (Math.pow(2, attempt - 1) * 1000);
-                        CompletableFuture<HttpResponse<T>> delayedFuture = new CompletableFuture<>();
-                        scheduler.schedule(() -> {
-                            executeWithRetryAsync(requestSupplier, responseBodyHandler, attempt + 1)
-                                    .whenComplete((res, ex) -> {
-                                        if (ex != null) delayedFuture.completeExceptionally(ex);
-                                        else delayedFuture.complete(res);
-                                    });
-                        }, delay, TimeUnit.MILLISECONDS);
-                        return delayedFuture;
+                        return retryLater(requestSupplier, responseBodyHandler, attempt + 1, throttleWaits, throttles, delay);
                     }
                     return CompletableFuture.completedFuture(response);
                 })
-                // Not exceptionallyCompose(): that is Java 12+, and this SDK promises Java 11.
-                // handle() + thenCompose() is the Java 11 spelling of the same thing.
-                .handle((response, ex) -> ex == null
-                        ? CompletableFuture.completedFuture(response)
-                        : retryAfterFailure(requestSupplier, responseBodyHandler, attempt, ex))
                 .thenCompose(f -> f);
     }
 
@@ -132,23 +184,98 @@ public class PdfikClient implements AutoCloseable {
             Supplier<HttpRequest> requestSupplier,
             HttpResponse.BodyHandler<T> responseBodyHandler,
             int attempt,
+            int throttleWaits,
+            List<String> throttles,
             Throwable ex) {
         if (attempt < 3) {
             long delay = (long) (Math.pow(2, attempt - 1) * 1000);
-            CompletableFuture<HttpResponse<T>> delayedFuture = new CompletableFuture<>();
-            scheduler.schedule(() -> {
-                executeWithRetryAsync(requestSupplier, responseBodyHandler, attempt + 1)
-                        .whenComplete((res, ex2) -> {
-                            if (ex2 != null) delayedFuture.completeExceptionally(ex2);
-                            else delayedFuture.complete(res);
-                        });
-            }, delay, TimeUnit.MILLISECONDS);
-            return delayedFuture;
+            return retryLater(requestSupplier, responseBodyHandler, attempt + 1, throttleWaits, throttles, delay);
         }
         Throwable actualEx = (ex instanceof CompletionException) ? ex.getCause() : ex;
         // An API error (4xx after retries) is already a PdfikException: keep it.
         if (actualEx instanceof PdfikException) return CompletableFuture.failedFuture(actualEx);
         return CompletableFuture.failedFuture(new PdfikException("Connection failed: " + actualEx.getMessage(), 503, null, null));
+    }
+
+    private <T> CompletableFuture<HttpResponse<T>> retryLater(
+            Supplier<HttpRequest> requestSupplier,
+            HttpResponse.BodyHandler<T> responseBodyHandler,
+            int attempt,
+            int throttleWaits,
+            List<String> throttles,
+            long delayMs) {
+        CompletableFuture<HttpResponse<T>> delayedFuture = new CompletableFuture<>();
+        delayer.schedule(() -> {
+            executeWithRetryAsync(requestSupplier, responseBodyHandler, attempt, throttleWaits, throttles)
+                    .whenComplete((res, ex) -> {
+                        if (ex != null) delayedFuture.completeExceptionally(ex);
+                        else delayedFuture.complete(res);
+                    });
+        }, delayMs);
+        return delayedFuture;
+    }
+
+    /** A 429 whose documented case is one of {@code throttles}; every other 429 is raised at once. */
+    private boolean isThrottled(HttpResponse<?> response, List<String> throttles) {
+        if (response.statusCode() != 429) return false;
+        try {
+            JsonNode node = objectMapper.readTree(bodyText(response));
+            for (String slug : throttles) {
+                if (isCase(node, slug)) return true;
+            }
+            return false;
+        } catch (Exception notJson) {
+            return false;
+        }
+    }
+
+    /** The documented case {@code slug}: the fragment of the body's {@code type} URL, or its {@code error} code. */
+    private static boolean isCase(JsonNode node, String slug) {
+        if (node.path("type").asText().endsWith("#" + slug)) return true;
+        return node.path("error").asText().equalsIgnoreCase(slug.replace('-', '_'));
+    }
+
+    /**
+     * Milliseconds to wait out a throttle: the body's {@code retry_after_seconds}, else the
+     * {@code Retry-After} header in seconds, else 10 s; capped at 60 s.
+     */
+    private long throttleDelayMs(HttpResponse<?> response) {
+        long seconds = retryAfterSeconds(bodyText(response));
+        if (seconds <= 0) {
+            try {
+                seconds = Long.parseLong(response.headers().firstValue("Retry-After").orElse("").trim());
+            } catch (NumberFormatException notSeconds) {
+                seconds = 0;
+            }
+        }
+        if (seconds <= 0) return RETRY_AFTER_FALLBACK_MS;
+        return Math.min(seconds, RETRY_AFTER_CAP_MS / 1000) * 1000L;
+    }
+
+    /**
+     * Milliseconds to wait after a 429 while polling: the API's {@code retry_after_seconds}
+     * (capped at 60 s so the server cannot park the caller), else {@code fallbackMs}.
+     */
+    long throttleDelayMs(PdfikException e, long fallbackMs) {
+        long seconds = retryAfterSeconds(e.getResponseBody());
+        if (seconds <= 0) return fallbackMs;
+        return Math.min(seconds, RETRY_AFTER_CAP_MS / 1000) * 1000L;
+    }
+
+    private long retryAfterSeconds(String body) {
+        try {
+            return objectMapper.readTree(body == null ? "{}" : body).path("retry_after_seconds").asLong(0);
+        } catch (Exception notJson) {
+            return 0;
+        }
+    }
+
+    // An error answer to the download is JSON text too, although its handler reads bytes.
+    private static String bodyText(HttpResponse<?> response) {
+        Object body = response.body();
+        if (body == null) return "";
+        if (body instanceof byte[]) return new String((byte[]) body, StandardCharsets.UTF_8);
+        return body.toString();
     }
 
     /**
@@ -157,21 +284,6 @@ public class PdfikClient implements AutoCloseable {
      * so the message used to be empty. They read as
      * "options.viewport.width: Input should be less than or equal to 1920".
      */
-    /**
-     * Milliseconds to wait after a 429 while polling: the API's {@code retry_after_seconds}
-     * (capped at 60 s so the server cannot park the caller), else {@code fallbackMs}.
-     */
-    long throttleDelayMs(PdfikException e, long fallbackMs) {
-        try {
-            JsonNode node = objectMapper.readTree(e.getResponseBody() == null ? "{}" : e.getResponseBody());
-            long seconds = node.path("retry_after_seconds").asLong(0);
-            if (seconds > 0) return Math.min(seconds, 60) * 1000L;
-        } catch (Exception ignored) {
-            // not JSON — fall back
-        }
-        return fallbackMs;
-    }
-
     static String errorDetail(JsonNode detail) {
         if (detail == null || detail.isNull()) return null;
         if (detail.isArray()) {
@@ -196,10 +308,7 @@ public class PdfikClient implements AutoCloseable {
     private <T> void checkResponse(HttpResponse<T> response) {
         int status = response.statusCode();
         if (status < 200 || status >= 300) {
-            String body = "";
-            if (response.body() != null) {
-                body = response.body().toString();
-            }
+            String body = bodyText(response);
             String message = "API request failed with status " + status;
             String errorCode = null;
             try {
@@ -225,19 +334,22 @@ public class PdfikClient implements AutoCloseable {
     }
 
     private Supplier<HttpRequest> createPostRequest(String path, Object body, String idempotencyKey) {
+        // Chosen here, once per call, and not inside the supplier: the supplier runs again
+        // for every resend, and a resend under a new key would create a second job.
+        String key = idempotencyKey != null && !idempotencyKey.isEmpty()
+                ? idempotencyKey
+                : UUID.randomUUID().toString();
         return () -> {
             try {
                 String json = objectMapper.writeValueAsString(body);
-                HttpRequest.Builder builder = HttpRequest.newBuilder()
+                return HttpRequest.newBuilder()
                         .uri(URI.create(baseUrl + path))
                         .timeout(requestTimeout)
                         .header("X-API-Key", apiKey)
                         .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(json));
-                if (idempotencyKey != null && !idempotencyKey.isEmpty()) {
-                    builder.header("Idempotency-Key", idempotencyKey);
-                }
-                return builder.build();
+                        .header("Idempotency-Key", key)
+                        .POST(HttpRequest.BodyPublishers.ofString(json))
+                        .build();
             } catch (Exception e) {
                 throw new RuntimeException("Failed to serialize request body", e);
             }
@@ -580,7 +692,11 @@ public class PdfikClient implements AutoCloseable {
     }
 
     public JobStatusResponse getJob(String jobId) {
-        HttpResponse<String> response = executeWithRetry(createGetRequest("/jobs/" + jobId), HttpResponse.BodyHandlers.ofString());
+        return getJob(jobId, THROTTLE_WAITS);
+    }
+
+    private JobStatusResponse getJob(String jobId, int throttleWaits) {
+        HttpResponse<String> response = executeWithRetry(createGetRequest("/jobs/" + jobId), HttpResponse.BodyHandlers.ofString(), throttleWaits, THROTTLES);
         checkResponse(response);
         try {
             return objectMapper.readValue(response.body(), JobStatusResponse.class);
@@ -599,7 +715,9 @@ public class PdfikClient implements AutoCloseable {
         while (true) {
             JobStatusResponse job;
             try {
-                job = getJob(jobId);
+                // No waits in the request path: the loop below waits out a 429 itself,
+                // so one 429 costs one wait and the timeout stays in charge.
+                job = getJob(jobId, 0);
             } catch (PdfikException e) {
                 // A 429 while polling is a throttle, not a failure: on Free (10
                 // requests/min) a render longer than ~20 s used to end the wait with
@@ -609,7 +727,7 @@ public class PdfikClient implements AutoCloseable {
                     throw new PdfikException("Job " + jobId + " timed out", 408, "TIMEOUT", null);
                 }
                 try {
-                    Thread.sleep(throttleDelayMs(e, pollInterval.toMillis()));
+                    sleeper.sleep(throttleDelayMs(e, pollInterval.toMillis()));
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     throw new PdfikException("Polling interrupted", 500, null, null);
@@ -631,7 +749,7 @@ public class PdfikClient implements AutoCloseable {
                 throw new PdfikException("Job " + jobId + " timed out", 408, "TIMEOUT", null);
             }
             try {
-                Thread.sleep(pollInterval.toMillis());
+                sleeper.sleep(pollInterval.toMillis());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new PdfikException("Polling interrupted", 500, null, null);
@@ -654,10 +772,12 @@ public class PdfikClient implements AutoCloseable {
      * {@code htmlToImage}) return the raw PNG/JPEG bytes. Jobs submitted with
      * the {@code delivery} option have no download here — the file lives in
      * your own bucket (the {@code job.finished} webhook's {@code file_url})
-     * and this endpoint answers 404.
+     * and this endpoint answers 404. While another download of the same file is
+     * still streaming the API answers 429 {@code download-busy}; that is waited
+     * out here and costs no download attempt.
      */
     public byte[] downloadPdf(String jobId) {
-        HttpResponse<byte[]> response = executeWithRetry(createGetRequest("/jobs/" + jobId + "/download"), HttpResponse.BodyHandlers.ofByteArray());
+        HttpResponse<byte[]> response = executeWithRetry(createGetRequest("/jobs/" + jobId + "/download"), HttpResponse.BodyHandlers.ofByteArray(), THROTTLE_WAITS, DOWNLOAD_THROTTLES);
         checkResponse(response);
         return response.body();
     }
@@ -940,7 +1060,11 @@ public class PdfikClient implements AutoCloseable {
     }
 
     public CompletableFuture<JobStatusResponse> getJobAsync(String jobId) {
-        return executeWithRetryAsync(createGetRequest("/jobs/" + jobId), HttpResponse.BodyHandlers.ofString())
+        return getJobAsync(jobId, THROTTLE_WAITS);
+    }
+
+    private CompletableFuture<JobStatusResponse> getJobAsync(String jobId, int throttleWaits) {
+        return executeWithRetryAsync(createGetRequest("/jobs/" + jobId), HttpResponse.BodyHandlers.ofString(), 1, throttleWaits, THROTTLES)
                 .thenApply(response -> {
                     checkResponse(response);
                     try {
@@ -975,13 +1099,14 @@ public class PdfikClient implements AutoCloseable {
             return;
         }
 
-        getJobAsync(jobId).whenComplete((job, ex) -> {
+        // No waits in the request path, as in the sync wait: this loop waits out a 429 itself.
+        getJobAsync(jobId, 0).whenComplete((job, ex) -> {
             if (ex != null) {
                 Throwable cause = (ex instanceof CompletionException && ex.getCause() != null) ? ex.getCause() : ex;
                 // Same as the sync wait: a 429 while polling is waited out.
                 if (cause instanceof PdfikException && ((PdfikException) cause).getStatusCode() == 429) {
-                    scheduler.schedule(() -> waitForJobAsyncInternal(jobId, startTime, timeoutMs, pollInterval, resultFuture),
-                            throttleDelayMs((PdfikException) cause, pollInterval.toMillis()), TimeUnit.MILLISECONDS);
+                    delayer.schedule(() -> waitForJobAsyncInternal(jobId, startTime, timeoutMs, pollInterval, resultFuture),
+                            throttleDelayMs((PdfikException) cause, pollInterval.toMillis()));
                     return;
                 }
                 resultFuture.completeExceptionally(ex);
@@ -1002,9 +1127,9 @@ public class PdfikClient implements AutoCloseable {
                 return;
             }
 
-            scheduler.schedule(() -> {
+            delayer.schedule(() -> {
                 waitForJobAsyncInternal(jobId, startTime, timeoutMs, pollInterval, resultFuture);
-            }, pollInterval.toMillis(), TimeUnit.MILLISECONDS);
+            }, pollInterval.toMillis());
         });
     }
 
@@ -1018,7 +1143,7 @@ public class PdfikClient implements AutoCloseable {
     }
 
     public CompletableFuture<byte[]> downloadPdfAsync(String jobId) {
-        return executeWithRetryAsync(createGetRequest("/jobs/" + jobId + "/download"), HttpResponse.BodyHandlers.ofByteArray())
+        return executeWithRetryAsync(createGetRequest("/jobs/" + jobId + "/download"), HttpResponse.BodyHandlers.ofByteArray(), 1, THROTTLE_WAITS, DOWNLOAD_THROTTLES)
                 .thenApply(response -> {
                     checkResponse(response);
                     return response.body();
