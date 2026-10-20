@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.PropertyNamingStrategies;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import net.pdfik.models.*;
 
@@ -54,6 +55,11 @@ public class PdfikClient implements AutoCloseable {
     // Injectable time, so the retry and polling schedules are testable without sleeping.
     Sleeper sleeper = Thread::sleep;
     Delayer delayer;
+    // Floor for the per-request timeout of the *File ("wait": true) methods: the server
+    // answers by 45 s and the ingress cuts at 60 s, so 70 s guarantees the server's
+    // verdict always beats the client's own timeout — the configured requestTimeout
+    // (default 30 s) would cut a healthy wait. Package-private so tests can shrink it.
+    Duration syncRequestTimeout = Duration.ofSeconds(70);
 
     private PdfikClient(Builder builder) {
         if (builder.apiKey == null || builder.apiKey.trim().isEmpty()) {
@@ -215,6 +221,81 @@ public class PdfikClient implements AutoCloseable {
         return delayedFuture;
     }
 
+    // ------------------------------------------------------------------------------
+    // Synchronous mode ("wait": true). The API holds the creation request up to 45 s
+    // and answers with the FILE itself — or 503 #sync-timeout (job cancelled, NOT
+    // charged, Idempotency-Key released) or 422 #job-failed (the render failed,
+    // carrying the job's own error code). Unlike every other call, 5xx responses and
+    // network failures are NOT resent here: the one attempt may already have rendered
+    // — and charged — the job, and every resend holds the caller for another full
+    // render. In particular the 503 must never be auto-retried. Only the throttle
+    // 429s are waited out: they happen before the job is admitted, so resending
+    // under the call's one Idempotency-Key is free.
+    // ------------------------------------------------------------------------------
+
+    /** {@code executeWithRetry} minus the resends — see the section comment above. */
+    private <T> HttpResponse<T> executeNoResend(
+            Supplier<HttpRequest> requestSupplier,
+            HttpResponse.BodyHandler<T> responseBodyHandler) {
+        int throttled = 0;
+        while (true) {
+            HttpRequest request = requestSupplier.get();
+            try {
+                HttpResponse<T> response = httpClient.send(request, responseBodyHandler);
+                if (throttled < THROTTLE_WAITS && isThrottled(response, THROTTLES)) {
+                    throttled++;
+                    try {
+                        sleeper.sleep(throttleDelayMs(response));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new PdfikException("Request interrupted during retry delay", response.statusCode(), null, null);
+                    }
+                    continue;
+                }
+                return response;
+            } catch (java.io.IOException e) {
+                throw new PdfikException("Connection failed: " + e.getMessage(), 503, null, null);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new PdfikException("Request interrupted", 500, null, null);
+            }
+        }
+    }
+
+    /**
+     * Async twin of {@link #executeNoResend}. As in {@code executeWithRetryAsync},
+     * handle() sits directly on the send, so every level deals with its OWN send only:
+     * a throttle resend that has already given up is passed on as it is, never
+     * re-handled by the levels above it.
+     */
+    private <T> CompletableFuture<HttpResponse<T>> executeNoResendAsync(
+            Supplier<HttpRequest> requestSupplier,
+            HttpResponse.BodyHandler<T> responseBodyHandler,
+            int throttleWaits) {
+        HttpRequest request = requestSupplier.get();
+        return httpClient.sendAsync(request, responseBodyHandler)
+                .<CompletableFuture<HttpResponse<T>>>handle((response, ex) -> {
+                    if (ex != null) {
+                        Throwable actualEx = (ex instanceof CompletionException && ex.getCause() != null) ? ex.getCause() : ex;
+                        return CompletableFuture.failedFuture(
+                                new PdfikException("Connection failed: " + actualEx.getMessage(), 503, null, null));
+                    }
+                    if (throttleWaits > 0 && isThrottled(response, THROTTLES)) {
+                        CompletableFuture<HttpResponse<T>> delayedFuture = new CompletableFuture<>();
+                        delayer.schedule(() -> {
+                            executeNoResendAsync(requestSupplier, responseBodyHandler, throttleWaits - 1)
+                                    .whenComplete((res, resendEx) -> {
+                                        if (resendEx != null) delayedFuture.completeExceptionally(resendEx);
+                                        else delayedFuture.complete(res);
+                                    });
+                        }, throttleDelayMs(response));
+                        return delayedFuture;
+                    }
+                    return CompletableFuture.completedFuture(response);
+                })
+                .thenCompose(f -> f);
+    }
+
     /** A 429 whose documented case is one of {@code throttles}; every other 429 is raised at once. */
     private boolean isThrottled(HttpResponse<?> response, List<String> throttles) {
         if (response.statusCode() != 429) return false;
@@ -354,6 +435,80 @@ public class PdfikClient implements AutoCloseable {
                 throw new RuntimeException("Failed to serialize request body", e);
             }
         };
+    }
+
+    private Supplier<HttpRequest> createSyncPostRequest(String path, Object body, String idempotencyKey) {
+        // Chosen here, once per call, exactly as in createPostRequest: a throttle
+        // resend must reuse the key, or it would create a second job.
+        String key = idempotencyKey != null && !idempotencyKey.isEmpty()
+                ? idempotencyKey
+                : UUID.randomUUID().toString();
+        // "wait" is injected at serialization time and is deliberately NOT a field on
+        // the request models: there, a caller could set it on the plain job-creating
+        // methods too, which parse the answer as JobCreatedResponse — and would crash
+        // confusingly on the file bytes an upgraded server sends back.
+        String json;
+        try {
+            ObjectNode node = (ObjectNode) objectMapper.valueToTree(body);
+            node.put("wait", true);
+            json = objectMapper.writeValueAsString(node);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to serialize request body", e);
+        }
+        // The 70 s floor (see syncRequestTimeout); a larger configured timeout still wins.
+        Duration timeout = requestTimeout.compareTo(syncRequestTimeout) > 0 ? requestTimeout : syncRequestTimeout;
+        return () -> HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + path))
+                .timeout(timeout)
+                .header("X-API-Key", apiKey)
+                .header("Content-Type", "application/json")
+                .header("Idempotency-Key", key)
+                .POST(HttpRequest.BodyPublishers.ofString(json))
+                .build();
+    }
+
+    /** The file bytes of a sync ("wait": true) answer — or the exception its status and shape dictate. */
+    private byte[] syncFileBody(HttpResponse<byte[]> response) {
+        checkResponse(response); // 503 #sync-timeout, 422 #job-failed, auth/quota errors
+        String contentType = response.headers().firstValue("Content-Type").orElse("");
+        // An OLD server (from before synchronous mode) ignores "wait" silently and
+        // answers 202 with the usual JSON. That JSON must never be returned as file
+        // bytes — the job it names is real, so the message hands the caller its id
+        // and the way to fetch it.
+        if (response.statusCode() == 202 || contentType.toLowerCase(java.util.Locale.ROOT).contains("json")) {
+            String body = bodyText(response);
+            String jobId = "";
+            try {
+                jobId = objectMapper.readTree(body).path("job_id").asText("");
+            } catch (Exception ignored) {}
+            throw new PdfikException(
+                    "The API queued job " + jobId + " instead of answering with the file: it ignored \"wait\": true "
+                            + "(a server from before synchronous mode). Fetch the job with waitForJob(\"" + jobId
+                            + "\") + downloadPdf, or use the job-creating methods.",
+                    response.statusCode(), "SYNC_MODE_UNSUPPORTED", body);
+        }
+        return response.body();
+    }
+
+    /** The *File methods stream the file back on the response; delivery would send it to a bucket instead. */
+    private static void requireNoDelivery(DeliveryOptions delivery) {
+        if (delivery != null) {
+            throw new IllegalArgumentException(
+                    "The *File methods ask the API to answer with the file (\"wait\": true); delivery (BYOB) uploads "
+                            + "it to your own bucket instead — the two cannot be combined. Submit without delivery, or "
+                            + "use the job-creating method and let the webhook confirm the upload.");
+        }
+    }
+
+    private byte[] requestFile(String path, Object request, String idempotencyKey) {
+        return syncFileBody(executeNoResend(
+                createSyncPostRequest(path, request, idempotencyKey), HttpResponse.BodyHandlers.ofByteArray()));
+    }
+
+    private CompletableFuture<byte[]> requestFileAsync(String path, Object request, String idempotencyKey) {
+        return executeNoResendAsync(
+                createSyncPostRequest(path, request, idempotencyKey), HttpResponse.BodyHandlers.ofByteArray(), THROTTLE_WAITS)
+                .thenApply(this::syncFileBody);
     }
 
     private Supplier<HttpRequest> createGetRequest(String path) {
@@ -782,6 +937,169 @@ public class PdfikClient implements AutoCloseable {
         return response.body();
     }
 
+    // Synchronous one-call API ("wait": true)
+
+    /**
+     * Renders a public URL and returns the PDF bytes in one call: the API holds the
+     * request until the render finishes (up to 45 s) and streams the file back, so
+     * there is no job to poll and nothing to download. The job's id rides the
+     * {@code X-PDFik-Job-Id} response header, and the file also stays downloadable
+     * for the normal 24 h.
+     *
+     * <p>Outcomes beyond the file, all thrown as {@link PdfikException}:
+     * <ul>
+     *   <li>{@code 503} / {@code SYNC_TIMEOUT} — the render did not finish in time.
+     *       The job was cancelled, NOT charged, and its Idempotency-Key released. The
+     *       client deliberately does not retry: every retry is a full re-render — for
+     *       renders this long, submit with {@link #urlToPdf(String)} and use a webhook
+     *       or {@link #waitForJob(String)} instead.</li>
+     *   <li>{@code 422} carrying the job's own error code ({@code PAGE_TIMEOUT},
+     *       {@code SSRF_BLOCKED}, …) — the render failed; the body names the job.</li>
+     *   <li>{@code SYNC_MODE_UNSUPPORTED} — the server ignored {@code wait} and queued
+     *       the job (a 202/JSON answer from a server from before synchronous mode);
+     *       the message names the job it created.</li>
+     * </ul>
+     *
+     * <p>Unlike the job-creating methods, 5xx responses and network failures are NOT
+     * resent — the one attempt may already have rendered (and charged) the job. Only
+     * the rate-limit and concurrency {@code 429}s are waited out, as on every call,
+     * under the one Idempotency-Key the call keeps.
+     */
+    public byte[] urlToPdfFile(String url) {
+        return urlToPdfFile(new UrlToPdfRequest(url, null, null, null), null);
+    }
+
+    /**
+     * Request-object variant of {@link #urlToPdfFile(String)} — every field except
+     * {@code delivery}, which is rejected with {@link IllegalArgumentException}
+     * before any HTTP: the file comes back on this very response instead of going
+     * to a bucket.
+     */
+    public byte[] urlToPdfFile(UrlToPdfRequest request) {
+        return urlToPdfFile(request, null);
+    }
+
+    /**
+     * @param idempotencyKey optional Idempotency-Key, reused across the call's own
+     *                       throttle waits; a timed-out sync job releases it, so a
+     *                       retry of yours safely creates a fresh job
+     */
+    public byte[] urlToPdfFile(UrlToPdfRequest request, String idempotencyKey) {
+        requireNoDelivery(request.getDelivery());
+        return requestFile("/url-to-pdf", request, idempotencyKey);
+    }
+
+    /**
+     * Renders raw HTML and returns the PDF bytes in one call ({@code "wait": true}).
+     * Outcomes and the no-resend rule: see {@link #urlToPdfFile(String)}.
+     */
+    public byte[] htmlToPdfFile(String html) {
+        return htmlToPdfFile(new HtmlToPdfRequest(html, null, null, null), null);
+    }
+
+    /** Request-object variant of {@link #htmlToPdfFile(String)}; {@code delivery} is rejected. */
+    public byte[] htmlToPdfFile(HtmlToPdfRequest request) {
+        return htmlToPdfFile(request, null);
+    }
+
+    /**
+     * @param idempotencyKey optional Idempotency-Key, see {@link #urlToPdfFile(UrlToPdfRequest, String)}
+     */
+    public byte[] htmlToPdfFile(HtmlToPdfRequest request, String idempotencyKey) {
+        requireNoDelivery(request.getDelivery());
+        return requestFile("/html-to-pdf", request, idempotencyKey);
+    }
+
+    /**
+     * Converts Markdown and returns the PDF bytes in one call ({@code "wait": true}).
+     * Outcomes and the no-resend rule: see {@link #urlToPdfFile(String)}.
+     */
+    public byte[] markdownToPdfFile(String markdown) {
+        return markdownToPdfFile(new MarkdownToPdfRequest(markdown), null);
+    }
+
+    /** Request-object variant of {@link #markdownToPdfFile(String)}; {@code delivery} is rejected. */
+    public byte[] markdownToPdfFile(MarkdownToPdfRequest request) {
+        return markdownToPdfFile(request, null);
+    }
+
+    /**
+     * @param idempotencyKey optional Idempotency-Key, see {@link #urlToPdfFile(UrlToPdfRequest, String)}
+     */
+    public byte[] markdownToPdfFile(MarkdownToPdfRequest request, String idempotencyKey) {
+        requireNoDelivery(request.getDelivery());
+        return requestFile("/markdown-to-pdf", request, idempotencyKey);
+    }
+
+    /**
+     * Captures a public URL as a screenshot and returns the image bytes in one call
+     * ({@code "wait": true}) — PNG with the server defaults, or what
+     * {@code ImageOptions} asks for on the request-object variant. Outcomes and the
+     * no-resend rule: see {@link #urlToPdfFile(String)}.
+     */
+    public byte[] urlToImageFile(String url) {
+        return urlToImageFile(new UrlToImageRequest(url), null);
+    }
+
+    /** Request-object variant of {@link #urlToImageFile(String)}; {@code delivery} is rejected. */
+    public byte[] urlToImageFile(UrlToImageRequest request) {
+        return urlToImageFile(request, null);
+    }
+
+    /**
+     * @param idempotencyKey optional Idempotency-Key, see {@link #urlToPdfFile(UrlToPdfRequest, String)}
+     */
+    public byte[] urlToImageFile(UrlToImageRequest request, String idempotencyKey) {
+        requireNoDelivery(request.getDelivery());
+        return requestFile("/url-to-image", request, idempotencyKey);
+    }
+
+    /**
+     * Captures raw HTML as a screenshot and returns the image bytes in one call
+     * ({@code "wait": true}). Outcomes and the no-resend rule: see
+     * {@link #urlToPdfFile(String)}.
+     */
+    public byte[] htmlToImageFile(String html) {
+        return htmlToImageFile(new HtmlToImageRequest(html), null);
+    }
+
+    /** Request-object variant of {@link #htmlToImageFile(String)}; {@code delivery} is rejected. */
+    public byte[] htmlToImageFile(HtmlToImageRequest request) {
+        return htmlToImageFile(request, null);
+    }
+
+    /**
+     * @param idempotencyKey optional Idempotency-Key, see {@link #urlToPdfFile(UrlToPdfRequest, String)}
+     */
+    public byte[] htmlToImageFile(HtmlToImageRequest request, String idempotencyKey) {
+        requireNoDelivery(request.getDelivery());
+        return requestFile("/html-to-image", request, idempotencyKey);
+    }
+
+    /**
+     * Generates a Factur-X e-invoice PDF/A-3 from CII XML and returns its bytes in
+     * one call ({@code "wait": true}). The {@code minimum}/{@code basicwl} profile
+     * note that rides {@code detail} on the asynchronous 202 travels in the
+     * {@code X-PDFik-Warning} response header here. Outcomes and the no-resend rule:
+     * see {@link #urlToPdfFile(String)}.
+     */
+    public byte[] einvoiceToPdfFile(String xml) {
+        return einvoiceToPdfFile(new EInvoiceToPdfRequest(xml), null);
+    }
+
+    /** Request-object variant of {@link #einvoiceToPdfFile(String)}; {@code delivery} is rejected. */
+    public byte[] einvoiceToPdfFile(EInvoiceToPdfRequest request) {
+        return einvoiceToPdfFile(request, null);
+    }
+
+    /**
+     * @param idempotencyKey optional Idempotency-Key, see {@link #urlToPdfFile(UrlToPdfRequest, String)}
+     */
+    public byte[] einvoiceToPdfFile(EInvoiceToPdfRequest request, String idempotencyKey) {
+        requireNoDelivery(request.getDelivery());
+        return requestFile("/einvoice-to-pdf", request, idempotencyKey);
+    }
+
     // Asynchronous API (CompletableFuture)
 
     public CompletableFuture<JobCreatedResponse> urlToPdfAsync(String url) {
@@ -1148,6 +1466,108 @@ public class PdfikClient implements AutoCloseable {
                     checkResponse(response);
                     return response.body();
                 });
+    }
+
+    // Synchronous one-call API — async twins. The future completes with the file
+    // bytes, or exceptionally with the same PdfikExceptions the sync forms throw
+    // (503 SYNC_TIMEOUT and connection failures included — never resent, see
+    // urlToPdfFile). A request with `delivery` set is rejected before any HTTP,
+    // by throwing IllegalArgumentException directly rather than failing the future.
+
+    /** Async twin of {@link #urlToPdfFile(String)}. */
+    public CompletableFuture<byte[]> urlToPdfFileAsync(String url) {
+        return urlToPdfFileAsync(new UrlToPdfRequest(url, null, null, null), null);
+    }
+
+    /** Async twin of {@link #urlToPdfFile(UrlToPdfRequest)}. */
+    public CompletableFuture<byte[]> urlToPdfFileAsync(UrlToPdfRequest request) {
+        return urlToPdfFileAsync(request, null);
+    }
+
+    /** Async twin of {@link #urlToPdfFile(UrlToPdfRequest, String)}. */
+    public CompletableFuture<byte[]> urlToPdfFileAsync(UrlToPdfRequest request, String idempotencyKey) {
+        requireNoDelivery(request.getDelivery());
+        return requestFileAsync("/url-to-pdf", request, idempotencyKey);
+    }
+
+    /** Async twin of {@link #htmlToPdfFile(String)}. */
+    public CompletableFuture<byte[]> htmlToPdfFileAsync(String html) {
+        return htmlToPdfFileAsync(new HtmlToPdfRequest(html, null, null, null), null);
+    }
+
+    /** Async twin of {@link #htmlToPdfFile(HtmlToPdfRequest)}. */
+    public CompletableFuture<byte[]> htmlToPdfFileAsync(HtmlToPdfRequest request) {
+        return htmlToPdfFileAsync(request, null);
+    }
+
+    /** Async twin of {@link #htmlToPdfFile(HtmlToPdfRequest, String)}. */
+    public CompletableFuture<byte[]> htmlToPdfFileAsync(HtmlToPdfRequest request, String idempotencyKey) {
+        requireNoDelivery(request.getDelivery());
+        return requestFileAsync("/html-to-pdf", request, idempotencyKey);
+    }
+
+    /** Async twin of {@link #markdownToPdfFile(String)}. */
+    public CompletableFuture<byte[]> markdownToPdfFileAsync(String markdown) {
+        return markdownToPdfFileAsync(new MarkdownToPdfRequest(markdown), null);
+    }
+
+    /** Async twin of {@link #markdownToPdfFile(MarkdownToPdfRequest)}. */
+    public CompletableFuture<byte[]> markdownToPdfFileAsync(MarkdownToPdfRequest request) {
+        return markdownToPdfFileAsync(request, null);
+    }
+
+    /** Async twin of {@link #markdownToPdfFile(MarkdownToPdfRequest, String)}. */
+    public CompletableFuture<byte[]> markdownToPdfFileAsync(MarkdownToPdfRequest request, String idempotencyKey) {
+        requireNoDelivery(request.getDelivery());
+        return requestFileAsync("/markdown-to-pdf", request, idempotencyKey);
+    }
+
+    /** Async twin of {@link #urlToImageFile(String)}. */
+    public CompletableFuture<byte[]> urlToImageFileAsync(String url) {
+        return urlToImageFileAsync(new UrlToImageRequest(url), null);
+    }
+
+    /** Async twin of {@link #urlToImageFile(UrlToImageRequest)}. */
+    public CompletableFuture<byte[]> urlToImageFileAsync(UrlToImageRequest request) {
+        return urlToImageFileAsync(request, null);
+    }
+
+    /** Async twin of {@link #urlToImageFile(UrlToImageRequest, String)}. */
+    public CompletableFuture<byte[]> urlToImageFileAsync(UrlToImageRequest request, String idempotencyKey) {
+        requireNoDelivery(request.getDelivery());
+        return requestFileAsync("/url-to-image", request, idempotencyKey);
+    }
+
+    /** Async twin of {@link #htmlToImageFile(String)}. */
+    public CompletableFuture<byte[]> htmlToImageFileAsync(String html) {
+        return htmlToImageFileAsync(new HtmlToImageRequest(html), null);
+    }
+
+    /** Async twin of {@link #htmlToImageFile(HtmlToImageRequest)}. */
+    public CompletableFuture<byte[]> htmlToImageFileAsync(HtmlToImageRequest request) {
+        return htmlToImageFileAsync(request, null);
+    }
+
+    /** Async twin of {@link #htmlToImageFile(HtmlToImageRequest, String)}. */
+    public CompletableFuture<byte[]> htmlToImageFileAsync(HtmlToImageRequest request, String idempotencyKey) {
+        requireNoDelivery(request.getDelivery());
+        return requestFileAsync("/html-to-image", request, idempotencyKey);
+    }
+
+    /** Async twin of {@link #einvoiceToPdfFile(String)}. */
+    public CompletableFuture<byte[]> einvoiceToPdfFileAsync(String xml) {
+        return einvoiceToPdfFileAsync(new EInvoiceToPdfRequest(xml), null);
+    }
+
+    /** Async twin of {@link #einvoiceToPdfFile(EInvoiceToPdfRequest)}. */
+    public CompletableFuture<byte[]> einvoiceToPdfFileAsync(EInvoiceToPdfRequest request) {
+        return einvoiceToPdfFileAsync(request, null);
+    }
+
+    /** Async twin of {@link #einvoiceToPdfFile(EInvoiceToPdfRequest, String)}. */
+    public CompletableFuture<byte[]> einvoiceToPdfFileAsync(EInvoiceToPdfRequest request, String idempotencyKey) {
+        requireNoDelivery(request.getDelivery());
+        return requestFileAsync("/einvoice-to-pdf", request, idempotencyKey);
     }
 
     @Override

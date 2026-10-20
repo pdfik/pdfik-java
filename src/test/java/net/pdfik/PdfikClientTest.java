@@ -32,6 +32,8 @@ public class PdfikClientTest {
     // the Retry-After header only.
     private static final String DOWNLOAD_BUSY = "{\"type\":\"https://docs.pdfik.net/error-codes#download-busy\",\"title\":\"Too Many Requests - Download In Progress\",\"status\":429,\"error\":\"DOWNLOAD_BUSY\",\"detail\":\"Another download of this file is already in progress. Only one active stream per file is allowed; this rejection does not consume a download attempt.\"}";
     private static final String UUID_V4 = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+    // The sync-mode deadline answer, exactly as pdf-api shapes it (app/core/sync_wait.py).
+    private static final String SYNC_TIMEOUT_503 = "{\"type\":\"https://docs.pdfik.net/error-codes#sync-timeout\",\"title\":\"Gateway Timeout - Render Did Not Finish In Time\",\"status\":503,\"error\":\"SYNC_TIMEOUT\",\"detail\":\"The render did not finish within 45 seconds. The job was cancelled and NOT charged, and its Idempotency-Key was released, so retrying is safe. For renders this long, submit without \\\"wait\\\" and use a webhook or polling instead.\",\"job_id\":\"job-sync-slow\"}";
 
     private static WireMockServer wireMockServer;
     private PdfikClient client;
@@ -672,7 +674,12 @@ public class PdfikClientTest {
 
     @Test
     public void testEveryCreateMethodSendsItsOwnGeneratedKey() throws Exception {
-        wireMockServer.stubFor(post(anyUrl()).willReturn(jobQueued()));
+        // The *File calls carry "wait": true and must get a file back; everything else
+        // gets the usual 202. One stub pair tells them apart by the body itself.
+        wireMockServer.stubFor(post(anyUrl()).atPriority(2).willReturn(jobQueued()));
+        wireMockServer.stubFor(post(anyUrl()).atPriority(1)
+                .withRequestBody(matchingJsonPath("$.wait", equalTo("true")))
+                .willReturn(pdf(new byte[]{1, 2, 3})));
 
         client.urlToPdf("https://example.com");
         client.htmlToPdf("<h1>Hello</h1>");
@@ -686,16 +693,28 @@ public class PdfikClientTest {
         client.urlToImageAsync("https://example.com").get();
         client.htmlToImageAsync("<h1>Hello</h1>").get();
         client.einvoiceToPdfAsync("<rsm:CrossIndustryInvoice/>").get();
+        client.urlToPdfFile("https://example.com");
+        client.htmlToPdfFile("<h1>Hello</h1>");
+        client.markdownToPdfFile("# Hi");
+        client.urlToImageFile("https://example.com");
+        client.htmlToImageFile("<h1>Hello</h1>");
+        client.einvoiceToPdfFile("<rsm:CrossIndustryInvoice/>");
+        client.urlToPdfFileAsync("https://example.com").get();
+        client.htmlToPdfFileAsync("<h1>Hello</h1>").get();
+        client.markdownToPdfFileAsync("# Hi").get();
+        client.urlToImageFileAsync("https://example.com").get();
+        client.htmlToImageFileAsync("<h1>Hello</h1>").get();
+        client.einvoiceToPdfFileAsync("<rsm:CrossIndustryInvoice/>").get();
 
         List<String> keys = idempotencyKeys(postRequestedFor(anyUrl()));
-        assertEquals(12, keys.size());
+        assertEquals(24, keys.size());
         for (String key : keys) {
             assertNotNull(key);
             assertTrue(key.matches(UUID_V4), key);
         }
-        assertEquals(12, new HashSet<>(keys).size(), keys.toString());
+        assertEquals(24, new HashSet<>(keys).size(), keys.toString());
         for (String path : List.of("/url-to-pdf", "/html-to-pdf", "/markdown-to-pdf", "/url-to-image", "/html-to-image", "/einvoice-to-pdf")) {
-            wireMockServer.verify(2, postRequestedFor(urlEqualTo(path)));
+            wireMockServer.verify(4, postRequestedFor(urlEqualTo(path)));
         }
     }
 
@@ -1181,6 +1200,233 @@ public class PdfikClientTest {
         byte[] result = client.downloadPdf("job-123");
         assertNotNull(result);
         assertArrayEquals(fakePdf, result);
+    }
+
+    // --- Synchronous one-call API ("wait": true) ---
+
+    @Test
+    public void testUrlToPdfFileReturnsBytesAndSendsWaitTrueWithAKey() {
+        byte[] fakePdf = new byte[]{0x25, 0x50, 0x44, 0x46, 1, 2, 3};
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-pdf"))
+                .withHeader("X-API-Key", equalTo("sk_test_123"))
+                .withRequestBody(matchingJsonPath("$.url", equalTo("https://example.com")))
+                .withRequestBody(matchingJsonPath("$.wait", equalTo("true")))
+                .willReturn(pdf(fakePdf).withHeader("X-PDFik-Job-Id", "job-sync-1")));
+
+        assertArrayEquals(fakePdf, client.urlToPdfFile("https://example.com"));
+        assertOneGeneratedKey(idempotencyKeys(postRequestedFor(urlEqualTo("/url-to-pdf"))), 1);
+    }
+
+    @Test
+    public void testUrlToPdfFileSyncTimeout503IsRaisedAtOnceAndNeverResent() {
+        // A 503 would be resent by the ordinary executor (>= 500). Here it must not be:
+        // the job was cancelled and the key released, so an automatic resend would start
+        // a fresh 45 s render the caller never asked for.
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-pdf"))
+                .willReturn(aResponse().withStatus(503)
+                        .withHeader("Content-Type", "application/problem+json")
+                        .withBody(SYNC_TIMEOUT_503)));
+        List<Long> waits = recordWaits();
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> client.urlToPdfFile("https://example.com"));
+
+        assertEquals(503, exception.getStatusCode());
+        assertEquals("SYNC_TIMEOUT", exception.getErrorCode());
+        assertTrue(exception.getResponseBody().contains("job-sync-slow"));
+        assertTrue(waits.isEmpty());
+        wireMockServer.verify(1, postRequestedFor(urlEqualTo("/url-to-pdf")));
+    }
+
+    @Test
+    public void testFileCallWaitsOutARateLimitUnderOneKey() {
+        // The throttle happens before the job is admitted, so the resend under the same
+        // key is the one resend the *File methods keep.
+        byte[] fakePdf = new byte[]{0, 1, 2, 3, 4};
+        stubInOrder(() -> post(urlEqualTo("/markdown-to-pdf")), rateLimited(3), pdf(fakePdf));
+        List<Long> waits = recordWaits();
+
+        assertArrayEquals(fakePdf, client.markdownToPdfFile("# Hi"));
+
+        assertEquals(List.of(3000L), waits);
+        assertOneGeneratedKey(idempotencyKeys(postRequestedFor(urlEqualTo("/markdown-to-pdf"))), 2);
+    }
+
+    @Test
+    public void testFileCallOnAnOldServerThrowsNamingTheJobId() {
+        // An old server ignores "wait" silently and answers 202 with the usual JSON.
+        // Returning that JSON as "file bytes" would corrupt whatever the caller writes
+        // it to, so it is an error that names the job the server did create.
+        wireMockServer.stubFor(post(urlEqualTo("/html-to-pdf")).willReturn(jobQueued()));
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> client.htmlToPdfFile("<h1>Hello</h1>"));
+
+        assertTrue(exception.getMessage().contains("job-throttled"), exception.getMessage());
+        assertEquals("SYNC_MODE_UNSUPPORTED", exception.getErrorCode());
+        wireMockServer.verify(1, postRequestedFor(urlEqualTo("/html-to-pdf")));
+    }
+
+    @Test
+    public void testFileCallOnAJson200ThrowsInsteadOfReturningJsonAsBytes() {
+        // Belt and braces for a proxy that rewrites the status: JSON on any 2xx is the
+        // old-server answer, never a file.
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-image"))
+                .willReturn(aResponse().withStatus(200)
+                        .withHeader("Content-Type", "application/json; charset=utf-8")
+                        .withBody("{\"job_id\":\"job-json-200\",\"status\":\"queued\",\"detail\":\"Job queued\"}")));
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> client.urlToImageFile("https://example.com"));
+
+        assertTrue(exception.getMessage().contains("job-json-200"), exception.getMessage());
+        wireMockServer.verify(1, postRequestedFor(urlEqualTo("/url-to-image")));
+    }
+
+    @Test
+    public void testFileCallJobFailed422CarriesTheJobsOwnErrorCode() {
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-pdf"))
+                .willReturn(aResponse().withStatus(422)
+                        .withHeader("Content-Type", "application/problem+json")
+                        .withBody("{\"type\":\"https://docs.pdfik.net/error-codes#job-failed\",\"title\":\"Unprocessable Entity - Render Failed\",\"status\":422,\"error\":\"PAGE_TIMEOUT\",\"detail\":\"The render failed with error code PAGE_TIMEOUT. See https://docs.pdfik.net/error-codes#job-failed for what each code means.\",\"job_id\":\"job-sync-failed\"}")));
+        List<Long> waits = recordWaits();
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> client.urlToPdfFile("https://example.com"));
+
+        assertEquals(422, exception.getStatusCode());
+        assertEquals("PAGE_TIMEOUT", exception.getErrorCode());
+        assertTrue(exception.getResponseBody().contains("job-sync-failed"));
+        assertTrue(waits.isEmpty());
+        wireMockServer.verify(1, postRequestedFor(urlEqualTo("/url-to-pdf")));
+    }
+
+    @Test
+    public void testFileCallBrokenConnectionIsRaisedAfterOneAttempt() {
+        // The one attempt may already have rendered — and charged — the job, so unlike
+        // the job-creating calls there is no resend on a network failure either.
+        wireMockServer.stubFor(post(urlEqualTo("/html-to-image")).willReturn(aResponse().withFault(Fault.EMPTY_RESPONSE)));
+        List<Long> waits = recordWaits();
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> client.htmlToImageFile("<h1>Hi</h1>"));
+
+        assertEquals(503, exception.getStatusCode());
+        assertTrue(waits.isEmpty());
+        wireMockServer.verify(1, postRequestedFor(urlEqualTo("/html-to-image")));
+    }
+
+    @Test
+    public void testFileCall500IsRaisedAtOnceWithoutAResend() {
+        wireMockServer.stubFor(post(urlEqualTo("/einvoice-to-pdf"))
+                .willReturn(aResponse().withStatus(500).withBody("Internal Server Error")));
+        List<Long> waits = recordWaits();
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> client.einvoiceToPdfFile("<rsm:CrossIndustryInvoice/>"));
+
+        assertEquals(500, exception.getStatusCode());
+        assertTrue(waits.isEmpty());
+        wireMockServer.verify(1, postRequestedFor(urlEqualTo("/einvoice-to-pdf")));
+    }
+
+    @Test
+    public void testHtmlToPdfFileAsyncReturnsBytes() throws Exception {
+        byte[] fakePdf = new byte[]{0x25, 0x50, 0x44, 0x46, 9};
+        wireMockServer.stubFor(post(urlEqualTo("/html-to-pdf"))
+                .withRequestBody(matchingJsonPath("$.wait", equalTo("true")))
+                .willReturn(pdf(fakePdf)));
+
+        assertArrayEquals(fakePdf, client.htmlToPdfFileAsync("<h1>Hello</h1>").get());
+        assertOneGeneratedKey(idempotencyKeys(postRequestedFor(urlEqualTo("/html-to-pdf"))), 1);
+    }
+
+    @Test
+    public void testFileAsyncSyncTimeoutIsRaisedAfterOneAttempt() {
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-pdf"))
+                .willReturn(aResponse().withStatus(503)
+                        .withHeader("Content-Type", "application/problem+json")
+                        .withBody(SYNC_TIMEOUT_503)));
+        List<Long> waits = recordWaits();
+
+        ExecutionException failure = assertThrows(ExecutionException.class,
+                () -> client.urlToPdfFileAsync("https://example.com").get());
+
+        assertTrue(failure.getCause() instanceof PdfikException);
+        PdfikException exception = (PdfikException) failure.getCause();
+        assertEquals(503, exception.getStatusCode());
+        assertEquals("SYNC_TIMEOUT", exception.getErrorCode());
+        assertTrue(waits.isEmpty());
+        wireMockServer.verify(1, postRequestedFor(urlEqualTo("/url-to-pdf")));
+    }
+
+    @Test
+    public void testFileAsyncWaitsOutARateLimitUnderOneKey() throws Exception {
+        byte[] fakePdf = new byte[]{0, 1, 2, 3, 4};
+        stubInOrder(() -> post(urlEqualTo("/url-to-image")), rateLimited(2), rateLimited(4), pdf(fakePdf));
+        List<Long> waits = recordWaits();
+
+        assertArrayEquals(fakePdf, client.urlToImageFileAsync("https://example.com").get());
+
+        assertEquals(List.of(2000L, 4000L), waits);
+        assertOneGeneratedKey(idempotencyKeys(postRequestedFor(urlEqualTo("/url-to-image"))), 3);
+    }
+
+    @Test
+    public void testFileAsyncBrokenConnectionIsRaisedAfterOneAttempt() {
+        wireMockServer.stubFor(post(urlEqualTo("/markdown-to-pdf")).willReturn(aResponse().withFault(Fault.EMPTY_RESPONSE)));
+        List<Long> waits = recordWaits();
+
+        ExecutionException failure = assertThrows(ExecutionException.class,
+                () -> client.markdownToPdfFileAsync("# Hi").get());
+
+        assertTrue(failure.getCause() instanceof PdfikException);
+        assertEquals(503, ((PdfikException) failure.getCause()).getStatusCode());
+        assertTrue(waits.isEmpty());
+        wireMockServer.verify(1, postRequestedFor(urlEqualTo("/markdown-to-pdf")));
+    }
+
+    @Test
+    public void testFileRequestOutlivesTheConfiguredRequestTimeout() {
+        // The test client is built with requestTimeout 2 s; the server's sync answer can
+        // take up to 45 s, so the *File requests run under their own floor (70 s) instead.
+        // Shrunk here to keep the suite fast — the point is that 2 s does NOT cut the wait.
+        client.syncRequestTimeout = Duration.ofSeconds(5);
+        byte[] fakePdf = new byte[]{0x25, 0x50, 0x44, 0x46, 7};
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-pdf"))
+                .willReturn(pdf(fakePdf).withFixedDelay(2500)));
+
+        assertArrayEquals(fakePdf, client.urlToPdfFile("https://example.com"));
+        wireMockServer.verify(1, postRequestedFor(urlEqualTo("/url-to-pdf")));
+    }
+
+    @Test
+    public void testFileMethodsRejectTheDeliveryOptionBeforeAnyHttp() {
+        // "wait" streams the file back on the response; delivery sends it to a bucket
+        // instead — the combination has no meaning, so it is rejected locally.
+        DeliveryOptions delivery = new DeliveryOptions("https://bucket.example.com/out?sig=1");
+
+        UrlToPdfRequest urlRequest = new UrlToPdfRequest();
+        urlRequest.setUrl("https://example.com");
+        urlRequest.setDelivery(delivery);
+        assertThrows(IllegalArgumentException.class, () -> client.urlToPdfFile(urlRequest));
+        assertThrows(IllegalArgumentException.class, () -> client.urlToPdfFileAsync(urlRequest));
+
+        HtmlToPdfRequest htmlRequest = new HtmlToPdfRequest("<h1>Hi</h1>", null, null, null);
+        htmlRequest.setDelivery(delivery);
+        assertThrows(IllegalArgumentException.class, () -> client.htmlToPdfFile(htmlRequest));
+
+        MarkdownToPdfRequest markdownRequest = new MarkdownToPdfRequest("# Hi");
+        markdownRequest.setDelivery(delivery);
+        assertThrows(IllegalArgumentException.class, () -> client.markdownToPdfFile(markdownRequest));
+
+        UrlToImageRequest urlImageRequest = new UrlToImageRequest("https://example.com");
+        urlImageRequest.setDelivery(delivery);
+        assertThrows(IllegalArgumentException.class, () -> client.urlToImageFile(urlImageRequest));
+
+        HtmlToImageRequest htmlImageRequest = new HtmlToImageRequest("<h1>Hi</h1>");
+        htmlImageRequest.setDelivery(delivery);
+        assertThrows(IllegalArgumentException.class, () -> client.htmlToImageFile(htmlImageRequest));
+
+        EInvoiceToPdfRequest einvoiceRequest = new EInvoiceToPdfRequest("<rsm:CrossIndustryInvoice/>");
+        einvoiceRequest.setDelivery(delivery);
+        assertThrows(IllegalArgumentException.class, () -> client.einvoiceToPdfFile(einvoiceRequest));
+
+        wireMockServer.verify(0, postRequestedFor(anyUrl()));
     }
 
     @Test

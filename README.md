@@ -1,18 +1,19 @@
 # pdfik-client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-12).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-20).
 > Releases to Maven Central are cut from the monorepo; issues and PRs are welcome here.
 
-Official Java SDK for [PDFik](https://pdfik.net) — the asynchronous URL/HTML-to-PDF API.
+Official Java SDK for [PDFik](https://pdfik.net) — the URL/HTML-to-PDF API.
 
-Submit a public URL or raw HTML, get a job id back, and receive an HMAC-signed webhook (or poll) when the PDF is ready. Rendering runs on sandboxed headless Chromium, so modern CSS, web fonts and JavaScript-heavy pages come out the way they look in the browser.
+One call gets you the file: `urlToPdfFile("https://example.com")` holds the request while PDFik renders (up to 45 s) and returns the PDF bytes. For batches and long renders the asynchronous flow is there too: submit, get a job id back, and receive an HMAC-signed webhook (or poll) when the PDF is ready. Rendering runs on sandboxed headless Chromium, so modern CSS, web fonts and JavaScript-heavy pages come out the way they look in the browser.
 
 ## Features
 
+- **One-call rendering**: the `*File` methods (`urlToPdfFile`, `htmlToPdfFile`, `markdownToPdfFile`, `urlToImageFile`, `htmlToImageFile`, `einvoiceToPdfFile`, each with an `...Async` twin) send `"wait": true` and return the file bytes directly — no polling, no download step.
 - **Modern HTTP**: Built on `java.net.http.HttpClient` (Java 11+ built-in client) with zero extra HTTP library dependencies.
 - **Fluent Builder**: Native Builder pattern for client and options creation.
 - **Sync & Async**: Exposes both block-oriented synchronous methods and non-blocking asynchronous variants (via `CompletableFuture`).
-- **Auto Retry**: `5xx` responses and network failures are retried with exponential backoff (3 attempts). A rate-limit or concurrency-limit `429` is waited out on every call — create, status and download — for the time the API states (up to 5 waits per call, each capped at 60 s), and so is a busy download (`download-busy`); every other `429` (quota, test-mode caps, an exhausted download counter) is thrown at once. Every create call carries an `Idempotency-Key` — yours if you pass one, otherwise a random one generated once per call and repeated each time that call is sent again — so a retried create cannot produce a second job.
+- **Auto Retry**: `5xx` responses and network failures are retried with exponential backoff (3 attempts). A rate-limit or concurrency-limit `429` is waited out on every call — create, status and download — for the time the API states (up to 5 waits per call, each capped at 60 s), and so is a busy download (`download-busy`); every other `429` (quota, test-mode caps, an exhausted download counter) is thrown at once. Every create call carries an `Idempotency-Key` — yours if you pass one, otherwise a random one generated once per call and repeated each time that call is sent again — so a retried create cannot produce a second job. **The `*File` methods are the carve-out**: beyond the throttle waits they never resend — a `5xx`, a network failure and in particular the `504` [sync-timeout](https://docs.pdfik.net/error-codes#sync-timeout) are thrown at once, because the one attempt may already have rendered (and charged) the job, and every automatic retry would be a full re-render. A timed-out sync job was cancelled, not charged, and its `Idempotency-Key` released, so whether to retry is your call.
 - **Jackson Integrated**: Uses standard `jackson-databind` for serialization/deserialization.
 
 ## Installation
@@ -25,7 +26,7 @@ Add the following dependency to your `pom.xml`:
 <dependency>
   <groupId>net.pdfik</groupId>
   <artifactId>pdfik-client</artifactId>
-  <version>0.3.2</version>
+  <version>0.4.0</version>
 </dependency>
 ```
 
@@ -34,12 +35,45 @@ Add the following dependency to your `pom.xml`:
 Add the following to your `build.gradle`:
 
 ```groovy
-implementation 'net.pdfik:pdfik-client:0.3.2'
+implementation 'net.pdfik:pdfik-client:0.4.0'
 ```
 
 ## Quick Start
 
-### Convert public URL to PDF (Sync)
+### One call, file back
+
+`urlToPdfFile` sends `"wait": true` for you: the API holds the request while the page renders (up to 45 s) and answers with the PDF itself — nothing to poll, nothing to download:
+
+```java
+import net.pdfik.PdfikClient;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+public class Main {
+    public static void main(String[] args) throws Exception {
+        try (PdfikClient client = PdfikClient.builder()
+                .apiKey("sk_live_...") // Retrieve from your dashboard
+                .build()) {
+
+            byte[] pdf = client.urlToPdfFile("https://example.com");
+            Files.write(Path.of("output.pdf"), pdf);
+            System.out.println("PDF saved to output.pdf (" + pdf.length + " bytes)");
+        }
+    }
+}
+```
+
+Every creation endpoint has this one-call form — `urlToPdfFile`, `htmlToPdfFile`, `markdownToPdfFile`, `urlToImageFile`, `htmlToImageFile` (image bytes back), `einvoiceToPdfFile` — each also taking the full request object plus an optional `Idempotency-Key`, and each with an `...Async` twin returning `CompletableFuture<byte[]>`. What to expect beyond the file, all thrown as `PdfikException`:
+
+- **`503` `SYNC_TIMEOUT`** — the render did not finish within the 45-second budget. The job was cancelled and **not charged**, and its `Idempotency-Key` was released, so retrying is safe — but the SDK deliberately never retries it for you (every retry is a full re-render). For renders this long, use the asynchronous flow below.
+- **`422`** carrying the job's own error code (`PAGE_TIMEOUT`, `PAGE_NOT_FOUND`, ...) via `getErrorCode()` — the render failed; the response body names the `job_id`.
+- A server from before synchronous mode ignores `wait` and answers `202` with the usual JSON; the `*File` methods detect that and throw an exception naming the job that was created, instead of handing JSON back as file bytes.
+
+Two deliberate differences from the job-creating methods: `5xx` responses and network failures are **not** resent (only the rate-limit/concurrency `429` waits remain — see Auto Retry above), and these requests run with a per-request timeout of at least 70 s whatever `requestTimeout` you configured, so the server's verdict always arrives before the client hangs up. The `delivery` (BYOB) option cannot be combined with `wait` and is rejected with `IllegalArgumentException` before any HTTP. The finished file also stays downloadable for the normal 24 h; its job id rides the `X-PDFik-Job-Id` response header.
+
+### Asynchronous flow: submit, poll (or webhook), download
+
+For batches, webhook-driven pipelines and renders longer than 45 s:
 
 ```java
 import net.pdfik.PdfikClient;

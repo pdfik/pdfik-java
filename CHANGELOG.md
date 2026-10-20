@@ -4,6 +4,50 @@ All notable changes to `net.pdfik:pdfik-client` are documented here. The format 
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] — 2026-10-20
+
+The synchronous one-call release (`"wait": true`).
+
+### Added
+- `urlToPdfFile`, `htmlToPdfFile`, `markdownToPdfFile`, `urlToImageFile`, `htmlToImageFile`
+  and `einvoiceToPdfFile` — each as `(String …)`, `(request)` and
+  `(request, idempotencyKey)` — plus the asynchronous twins returning
+  `CompletableFuture<byte[]>`. They send the creation request with `"wait": true`: the
+  API holds it until the render finishes (up to 45 s) and streams the file itself back
+  (`application/pdf`, `image/png` or `image/jpeg`), so there is no job to poll and
+  nothing to download. The job's id rides the `X-PDFik-Job-Id` response header, the
+  e-invoice `minimum`/`basicwl` profile note rides `X-PDFik-Warning`, and the file also
+  stays downloadable for the normal 24 h. `wait` is injected at serialization time and
+  is deliberately not a field on the request models — set there, it would reach the
+  job-creating methods too, which parse the answer as `JobCreatedResponse` and would
+  crash confusingly on file bytes.
+- The `*File` requests run with their own per-request timeout: at least 70 s, or the
+  configured `requestTimeout` when that is larger. The server answers by 45 s and the
+  ingress cuts at 60 s, so the default `requestTimeout` (30 s) would cut a healthy wait.
+- A render that does not finish in time answers `503` `SYNC_TIMEOUT`, thrown at once and
+  **never resent**: the job was cancelled, NOT charged, and its `Idempotency-Key`
+  released, so retrying is safe — but it is your call, because every automatic retry
+  would be a full re-render. For the same reason the `*File` methods do not resend on
+  any `5xx` or network failure either (the one attempt may already have rendered — and
+  charged — the job); only the rate-limit and concurrency `429`s are waited out, as on
+  every other call, under the one `Idempotency-Key` the call keeps.
+- A failed render answers `422` `#job-failed`, thrown as a `PdfikException` whose
+  `getErrorCode()` is the job's own error code (`PAGE_TIMEOUT`, `SSRF_BLOCKED`, …) and
+  whose response body names the `job_id`.
+- A server from before synchronous mode ignores `wait` silently and answers `202` with
+  the usual JSON. The `*File` methods detect that (a `202`, or JSON on any `2xx`) and
+  throw a `PdfikException` (`SYNC_MODE_UNSUPPORTED`) whose message names the job that was
+  created and how to fetch it — the JSON is never returned as file bytes.
+- `delivery` (BYOB) cannot be combined with `wait` — the file comes back on the response
+  instead of going to a bucket — so a request object with it set is rejected with
+  `IllegalArgumentException` before any HTTP.
+
+### Changed
+- README: the quick start opens with the one-call form; the asynchronous flow stays
+  below for batches, webhook pipelines and renders longer than 45 s; the Auto Retry
+  bullet carries the `*File` carve-out.
+- Version `0.3.2` → `0.4.0` (`pom.xml`, `build.gradle`, README coordinates).
+
 ## [0.3.2] — 2026-10-12
 
 ### Fixed
