@@ -4,6 +4,54 @@ All notable changes to `net.pdfik:pdfik-client` are documented here. The format 
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] — 2026-11-09
+
+### Fixed (also in 0.5.0, before its first publication)
+- `verifyWebhookSignature` returns `false` for an empty secret explicitly.
+- The async calls resend and label as `NETWORK_ERROR` only transport failures
+  (`IOException`), like the blocking ones; any other failure is passed on as it is.
+- `downloadPdf` / `downloadPdfAsync` are not resent: each started stream is one of the
+  file's three download attempts.
+- The `429` volume quota held by jobs that are still running is waited out.
+- A header or URL the client cannot send is thrown as itself, not as
+  "Failed to serialize request body".
+
+### Fixed
+- `PdfikClient.verifyWebhookSignature` checks every `v1` in `X-PDFik-Signature`. While
+  the overlap window of a secret rotation is open, PDFik signs each delivery with both
+  secrets and sends both signatures in the one header, the current secret's first:
+  `t=<unix seconds>,v1=<signature with the new secret>,v1=<signature with the previous secret>`.
+  The helper now accepts the delivery if any `v1` matches the secret you pass, comparing
+  each one in constant time. Up to 0.4.0 it kept only the last `v1` — inside a window,
+  the previous secret's — so a receiver already switched to the new secret would reject
+  every genuine delivery until the window closed: upgrade before you rotate with an
+  overlap window. A header with a single `v1`, the ±300 s timestamp rule and the
+  `boolean` result are unchanged. The ±300 s rule is now a plain range check: as
+  `Math.abs(now - t)` it overflowed for one absurd `t` (`now` − 2⁶³) and let it through
+  (the signature still had to match).
+- A connection failure — no HTTP answer at all (DNS failure, refused or reset
+  connection, TLS error, timeout) or a connection that breaks while the body is being
+  read — now throws `PdfikException` with `getErrorCode()` `"NETWORK_ERROR"` as well as
+  `getStatusCode()` `503`, the same code the JavaScript, Python and C# clients report.
+  It used to carry no error code, so code that branches on the code could not tell it
+  apart from a server's own `503`. Retries are unchanged: the ordinary calls resend it
+  like a `5xx` (a resent create keeps its `Idempotency-Key`), and the `*File` methods
+  throw it after their one attempt. Its message now names the failure even when the JDK
+  gives none — it read `Connection failed: null` for a host that cannot be resolved and,
+  on Java 17+, for a refused connection — and `getCause()` returns the JDK's exception.
+
+### Changed
+- README: "Handling Webhooks" says deliveries are signed once a signing secret has been
+  generated (until then they arrive unsigned), and describes the signature header, the
+  ±300 s rule and the two signatures of a rotation window (it used to advise checking the
+  new secret and then the old one yourself); the Auto Retry line names the
+  `NETWORK_ERROR` code.
+- Javadoc of `verifyWebhookSignature`: says deliveries are signed once a signing secret
+  has been generated (until then it returns `false` for them; it used to say every
+  delivery is signed), and describes the header and the rotation window; its Spring Boot
+  example reads `status` instead of an `event_type` field the payload does not have.
+- Version `0.4.0` → `0.5.0` (`pom.xml`, `build.gradle`, README coordinates).
+
 ## [0.4.0] — 2026-10-20
 
 The synchronous one-call release (`"wait": true`).

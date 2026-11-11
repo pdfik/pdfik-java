@@ -1,6 +1,6 @@
 # pdfik-client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-10-20).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-11-11).
 > Releases to Maven Central are cut from the monorepo; issues and PRs are welcome here.
 
 Official Java SDK for [PDFik](https://pdfik.net) — the URL/HTML-to-PDF API.
@@ -13,7 +13,7 @@ One call gets you the file: `urlToPdfFile("https://example.com")` holds the requ
 - **Modern HTTP**: Built on `java.net.http.HttpClient` (Java 11+ built-in client) with zero extra HTTP library dependencies.
 - **Fluent Builder**: Native Builder pattern for client and options creation.
 - **Sync & Async**: Exposes both block-oriented synchronous methods and non-blocking asynchronous variants (via `CompletableFuture`).
-- **Auto Retry**: `5xx` responses and network failures are retried with exponential backoff (3 attempts). A rate-limit or concurrency-limit `429` is waited out on every call — create, status and download — for the time the API states (up to 5 waits per call, each capped at 60 s), and so is a busy download (`download-busy`); every other `429` (quota, test-mode caps, an exhausted download counter) is thrown at once. Every create call carries an `Idempotency-Key` — yours if you pass one, otherwise a random one generated once per call and repeated each time that call is sent again — so a retried create cannot produce a second job. **The `*File` methods are the carve-out**: beyond the throttle waits they never resend — a `5xx`, a network failure and in particular the `503` [sync-timeout](https://docs.pdfik.net/error-codes#sync-timeout) are thrown at once, because the one attempt may already have rendered (and charged) the job, and every automatic retry would be a full re-render. A timed-out sync job was cancelled, not charged, and its `Idempotency-Key` released, so whether to retry is your call.
+- **Auto Retry**: `5xx` responses and network failures are retried with exponential backoff (3 attempts). A network failure — no HTTP answer at all, or a connection that breaks while the body is being read — is thrown as `PdfikException` with `getErrorCode()` `"NETWORK_ERROR"` and `getStatusCode()` `503`. A rate-limit or concurrency-limit `429` is waited out on every call — create, status and download — for the time the API states (up to 5 waits per call, each capped at 60 s), and so is a busy download (`download-busy`); every other `429` (quota, test-mode caps, an exhausted download counter) is thrown at once. Every create call carries an `Idempotency-Key` — yours if you pass one, otherwise a random one generated once per call and repeated each time that call is sent again — so a retried create cannot produce a second job. **The `*File` methods are the carve-out**: beyond the throttle waits they never resend — a `5xx`, a network failure and in particular the `503` [sync-timeout](https://docs.pdfik.net/error-codes#sync-timeout) are thrown at once, because the one attempt may already have rendered (and charged) the job, and every automatic retry would be a full re-render. A timed-out sync job was cancelled, not charged, and its `Idempotency-Key` released, so whether to retry is your call.
 - **Jackson Integrated**: Uses standard `jackson-databind` for serialization/deserialization.
 
 ## Installation
@@ -26,7 +26,7 @@ Add the following dependency to your `pom.xml`:
 <dependency>
   <groupId>net.pdfik</groupId>
   <artifactId>pdfik-client</artifactId>
-  <version>0.4.0</version>
+  <version>0.5.0</version>
 </dependency>
 ```
 
@@ -35,7 +35,7 @@ Add the following dependency to your `pom.xml`:
 Add the following to your `build.gradle`:
 
 ```groovy
-implementation 'net.pdfik:pdfik-client:0.4.0'
+implementation 'net.pdfik:pdfik-client:0.5.0'
 ```
 
 ## Quick Start
@@ -219,7 +219,7 @@ byte[] imageBytes = client.downloadPdf(job.getJobId()); // JPEG bytes
 JobCreatedResponse shot = client.htmlToImage("<h1>Hello</h1>"); // 1024x768 PNG
 ```
 
-`UrlToImageRequest` also accepts the Pro+ `auth` option (basic/bearer), exactly as `urlToPdf`. Passing `quality` together with PNG is rejected with `422`. Async variants: `markdownToPdfAsync`, `urlToImageAsync`, `htmlToImageAsync`.
+`UrlToImageRequest` also accepts the `auth` option (basic/bearer), exactly as `urlToPdf`. Passing `quality` together with PNG is rejected with `422`. Async variants: `markdownToPdfAsync`, `urlToImageAsync`, `htmlToImageAsync`.
 
 ### Deliver to your own bucket (BYOB)
 
@@ -284,9 +284,18 @@ If you specify `webhookUrl` in the options of `urlToPdf` or `htmlToPdf`, PDFik w
 
 You should verify the authenticity of the webhook by validating the signature. We provide a static helper `verifyWebhookSignature` in `PdfikClient` for this purpose.
 
-During a secret rotation both the new and the previous secret verify for the overlap
-window you pick in the dashboard (1 hour to 5 days, or none at all), so check the new
-one first and fall back to the old one while you roll your receivers out.
+Signing is on once you generate a signing secret on the Webhooks page of the dashboard
+(every plan, Free included); until then — or after you delete the secret — deliveries
+arrive without the `X-PDFik-Signature` and `X-PDFik-Timestamp` headers. While a secret
+is set, every delivery carries `X-PDFik-Signature: t=<unix seconds>,v1=<signature>` — the
+hex HMAC-SHA256 of `<t>.<raw body>` under your webhook secret — and `X-PDFik-Timestamp`;
+a `t` more than 300 seconds away from now is rejected. When you rotate the secret with
+an overlap window (picked in the dashboard: 1 hour to 5 days, or none at all), every
+delivery inside the window is signed with both secrets, current first:
+`t=<unix seconds>,v1=<signature with the new secret>,v1=<signature with the previous secret>`.
+`verifyWebhookSignature` accepts a delivery if any `v1` matches the secret you pass, so
+a receiver still holding the previous secret keeps working — switch each receiver to the
+new secret before the window closes.
 
 Custom delivery headers (e.g. a Cloudflare Access service token) are configured once on
 the dashboard Webhooks page and attached to every delivery — nothing to pass per request.

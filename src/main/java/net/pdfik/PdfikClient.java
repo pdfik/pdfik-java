@@ -91,6 +91,33 @@ public class PdfikClient implements AutoCloseable {
         return new Builder();
     }
 
+    /**
+     * A request that got no HTTP answer, or whose connection broke while the body was
+     * being read ({@code send} reads it before returning): status 503 and the code
+     * {@code NETWORK_ERROR}, as in the other PDFik SDKs. java.net.http often throws with
+     * no message at any level (a host that cannot be resolved on every JDK, a refused
+     * connection on Java 17+), so the first message down the cause chain is used, else
+     * the failure is named; the JDK's exception stays reachable through getCause().
+     * Package-private for the tests.
+     */
+    static PdfikException networkError(Throwable failure) {
+        String reason = null;
+        boolean unresolved = false;
+        // Capped: a cause chain can be cyclic.
+        Throwable t = failure;
+        for (int depth = 0; t != null && depth < 16; depth++, t = t.getCause()) {
+            if (t instanceof java.nio.channels.UnresolvedAddressException) unresolved = true;
+            String m = t.getMessage();
+            if (reason == null && m != null && !m.isEmpty()) reason = m;
+        }
+        if (reason == null) {
+            reason = unresolved ? "host could not be resolved" : failure.getClass().getName();
+        }
+        PdfikException e = new PdfikException("Connection failed: " + reason, 503, "NETWORK_ERROR", null);
+        e.initCause(failure);
+        return e;
+    }
+
     private <T> HttpResponse<T> executeWithRetry(
             Supplier<HttpRequest> requestSupplier,
             HttpResponse.BodyHandler<T> responseBodyHandler) {
@@ -102,6 +129,15 @@ public class PdfikClient implements AutoCloseable {
             HttpResponse.BodyHandler<T> responseBodyHandler,
             int throttleWaits,
             List<String> throttles) {
+        return executeWithRetry(requestSupplier, responseBodyHandler, throttleWaits, throttles, 3);
+    }
+
+    private <T> HttpResponse<T> executeWithRetry(
+            Supplier<HttpRequest> requestSupplier,
+            HttpResponse.BodyHandler<T> responseBodyHandler,
+            int throttleWaits,
+            List<String> throttles,
+            int maxAttempts) {
         int attempt = 0;
         int throttled = 0;
         while (true) {
@@ -121,7 +157,7 @@ public class PdfikClient implements AutoCloseable {
                     }
                     continue;
                 }
-                if (status >= 500 && attempt < 3) {
+                if (status >= 500 && attempt < maxAttempts) {
                     long delay = (long) (Math.pow(2, attempt - 1) * 1000);
                     try {
                         sleeper.sleep(delay);
@@ -133,7 +169,7 @@ public class PdfikClient implements AutoCloseable {
                 }
                 return response;
             } catch (java.io.IOException e) {
-                if (attempt < 3) {
+                if (attempt < maxAttempts) {
                     long delay = (long) (Math.pow(2, attempt - 1) * 1000);
                     try {
                         sleeper.sleep(delay);
@@ -143,7 +179,7 @@ public class PdfikClient implements AutoCloseable {
                     }
                     continue;
                 }
-                throw new PdfikException("Connection failed: " + e.getMessage(), 503, null, null);
+                throw networkError(e);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new PdfikException("Request interrupted", 500, null, null);
@@ -193,14 +229,17 @@ public class PdfikClient implements AutoCloseable {
             int throttleWaits,
             List<String> throttles,
             Throwable ex) {
+        Throwable actualEx = (ex instanceof CompletionException && ex.getCause() != null) ? ex.getCause() : ex;
+        // An API error is already a PdfikException; anything that is not a transport
+        // failure (a bug, a cancelled future, a bad header) is not a NETWORK_ERROR and is
+        // never resent. Same rule as the blocking calls, which resend IOException only.
+        if (actualEx instanceof PdfikException) return CompletableFuture.failedFuture(actualEx);
+        if (!(actualEx instanceof java.io.IOException)) return CompletableFuture.failedFuture(actualEx);
         if (attempt < 3) {
             long delay = (long) (Math.pow(2, attempt - 1) * 1000);
             return retryLater(requestSupplier, responseBodyHandler, attempt + 1, throttleWaits, throttles, delay);
         }
-        Throwable actualEx = (ex instanceof CompletionException) ? ex.getCause() : ex;
-        // An API error (4xx after retries) is already a PdfikException: keep it.
-        if (actualEx instanceof PdfikException) return CompletableFuture.failedFuture(actualEx);
-        return CompletableFuture.failedFuture(new PdfikException("Connection failed: " + actualEx.getMessage(), 503, null, null));
+        return CompletableFuture.failedFuture(networkError(actualEx));
     }
 
     private <T> CompletableFuture<HttpResponse<T>> retryLater(
@@ -254,7 +293,7 @@ public class PdfikClient implements AutoCloseable {
                 }
                 return response;
             } catch (java.io.IOException e) {
-                throw new PdfikException("Connection failed: " + e.getMessage(), 503, null, null);
+                throw networkError(e);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new PdfikException("Request interrupted", 500, null, null);
@@ -277,8 +316,7 @@ public class PdfikClient implements AutoCloseable {
                 .<CompletableFuture<HttpResponse<T>>>handle((response, ex) -> {
                     if (ex != null) {
                         Throwable actualEx = (ex instanceof CompletionException && ex.getCause() != null) ? ex.getCause() : ex;
-                        return CompletableFuture.failedFuture(
-                                new PdfikException("Connection failed: " + actualEx.getMessage(), 503, null, null));
+                        return CompletableFuture.failedFuture(networkError(actualEx));
                     }
                     if (throttleWaits > 0 && isThrottled(response, THROTTLES)) {
                         CompletableFuture<HttpResponse<T>> delayedFuture = new CompletableFuture<>();
@@ -304,7 +342,9 @@ public class PdfikClient implements AutoCloseable {
             for (String slug : throttles) {
                 if (isCase(node, slug)) return true;
             }
-            return false;
+            // The volume quota HELD by jobs still running clears by itself and says when;
+            // a used-up volume quota carries no retry_after_seconds.
+            return isCase(node, "quota-bytes-exceeded") && node.hasNonNull("retry_after_seconds");
         } catch (Exception notJson) {
             return false;
         }
@@ -421,8 +461,15 @@ public class PdfikClient implements AutoCloseable {
                 ? idempotencyKey
                 : UUID.randomUUID().toString();
         return () -> {
+            String json;
             try {
-                String json = objectMapper.writeValueAsString(body);
+                json = objectMapper.writeValueAsString(body);
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to serialize request body", e);
+            }
+            // A header or URL the client cannot send (a line break in the key, a bad base URL)
+            // is thrown as what it is, not as a serialization failure.
+            {
                 return HttpRequest.newBuilder()
                         .uri(URI.create(baseUrl + path))
                         .timeout(requestTimeout)
@@ -431,8 +478,6 @@ public class PdfikClient implements AutoCloseable {
                         .header("Idempotency-Key", key)
                         .POST(HttpRequest.BodyPublishers.ofString(json))
                         .build();
-            } catch (Exception e) {
-                throw new RuntimeException("Failed to serialize request body", e);
             }
         };
     }
@@ -792,7 +837,7 @@ public class PdfikClient implements AutoCloseable {
     /**
      * Full-control variant: the request object carries {@code options}
      * (format png/jpeg, fullPage, quality, viewport), {@code render},
-     * {@code webhookUrl}, {@code auth} (Pro+), {@code delivery} (BYOB) and
+     * {@code webhookUrl}, {@code auth}, {@code delivery} (BYOB) and
      * {@code test}.
      */
     public JobCreatedResponse urlToImage(UrlToImageRequest request) {
@@ -932,7 +977,8 @@ public class PdfikClient implements AutoCloseable {
      * out here and costs no download attempt.
      */
     public byte[] downloadPdf(String jobId) {
-        HttpResponse<byte[]> response = executeWithRetry(createGetRequest("/jobs/" + jobId + "/download"), HttpResponse.BodyHandlers.ofByteArray(), THROTTLE_WAITS, DOWNLOAD_THROTTLES);
+        // One attempt: every started stream is one of the file's three download attempts.
+        HttpResponse<byte[]> response = executeWithRetry(createGetRequest("/jobs/" + jobId + "/download"), HttpResponse.BodyHandlers.ofByteArray(), THROTTLE_WAITS, DOWNLOAD_THROTTLES, 1);
         checkResponse(response);
         return response.body();
     }
@@ -1461,7 +1507,9 @@ public class PdfikClient implements AutoCloseable {
     }
 
     public CompletableFuture<byte[]> downloadPdfAsync(String jobId) {
-        return executeWithRetryAsync(createGetRequest("/jobs/" + jobId + "/download"), HttpResponse.BodyHandlers.ofByteArray(), 1, THROTTLE_WAITS, DOWNLOAD_THROTTLES)
+        // Starts at attempt 3 = no resend: every started stream is one of the file's three
+        // download attempts.
+        return executeWithRetryAsync(createGetRequest("/jobs/" + jobId + "/download"), HttpResponse.BodyHandlers.ofByteArray(), 3, THROTTLE_WAITS, DOWNLOAD_THROTTLES)
                 .thenApply(response -> {
                     checkResponse(response);
                     return response.body();
@@ -1618,8 +1666,16 @@ public class PdfikClient implements AutoCloseable {
      * Verifies the authenticity of an incoming PDFik webhook request by validating
      * the HMAC-SHA256 signature in the {@code X-PDFik-Signature} header.
      *
-     * <p>PDFik signs every webhook delivery using the secret stored in your dashboard.
+     * <p>Once you generate a signing secret on the Webhooks page of the dashboard, PDFik
+     * signs every webhook delivery with it; until then deliveries arrive without the
+     * signature headers and this method returns {@code false} for them.
      * Always verify the signature <strong>before</strong> processing the event payload.</p>
+     *
+     * <p>The header is {@code t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>">},
+     * and {@code t} must be within ±300 s of now. While a rotated-out secret is still
+     * inside its overlap window the header carries one {@code v1} per secret
+     * ({@code t=...,v1=<new>,v1=<previous>}), so every {@code v1} is checked and the
+     * delivery is genuine if ANY of them matches {@code webhookSecret}.</p>
      *
      * <b>Spring Boot Example</b>
      * <pre>{@code
@@ -1653,8 +1709,8 @@ public class PdfikClient implements AutoCloseable {
      *         // Parse and handle the event
      *         // ObjectMapper om = new ObjectMapper();
      *         // Map<String, Object> event = om.readValue(rawBody, Map.class);
-     *         // String eventType = (String) event.get("event_type");
-     *         // String jobId    = (String) event.get("job_id");
+     *         // String status = (String) event.get("status"); // "done" or "failed"
+     *         // String jobId  = (String) event.get("job_id");
      *
      *         return ResponseEntity.ok(Map.of("received", true));
      *     }
@@ -1667,7 +1723,7 @@ public class PdfikClient implements AutoCloseable {
      * @return {@code true} if the signature is valid; {@code false} otherwise
      */
     public static boolean verifyWebhookSignature(String rawBody, java.util.Map<String, String> headers, String webhookSecret) {
-        if (rawBody == null || headers == null || webhookSecret == null) {
+        if (rawBody == null || headers == null || webhookSecret == null || webhookSecret.isEmpty()) {
             return false;
         }
 
@@ -1687,7 +1743,7 @@ public class PdfikClient implements AutoCloseable {
 
         try {
             String timestamp = null;
-            String receivedSig = null;
+            List<String> receivedSigs = new java.util.ArrayList<>();
             String[] parts = signatureHeader.split(",");
             for (String part : parts) {
                 String[] kv = part.split("=", 2);
@@ -1697,18 +1753,20 @@ public class PdfikClient implements AutoCloseable {
                     if ("t".equals(key)) {
                         timestamp = val;
                     } else if ("v1".equals(key)) {
-                        receivedSig = val;
+                        receivedSigs.add(val);
                     }
                 }
             }
 
-            if (timestamp == null || receivedSig == null) {
+            if (timestamp == null || receivedSigs.isEmpty()) {
                 return false;
             }
 
             long now = System.currentTimeMillis() / 1000;
             long ts = Long.parseLong(timestamp);
-            if (Math.abs(now - ts) > 300) {
+            // A range, not Math.abs(now - ts): for an absurd t the difference overflows,
+            // and Math.abs(Long.MIN_VALUE) is negative, so it would pass.
+            if (ts < now - 300 || ts > now + 300) {
                 return false;
             }
 
@@ -1727,12 +1785,17 @@ public class PdfikClient implements AutoCloseable {
                 if (hex.length() == 1) hexString.append('0');
                 hexString.append(hex);
             }
-            String expectedSig = hexString.toString();
+            byte[] expectedSig = hexString.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
-            return java.security.MessageDigest.isEqual(
-                    expectedSig.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                    receivedSig.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-            );
+            // Every candidate is compared, each in constant time.
+            boolean matched = false;
+            for (String receivedSig : receivedSigs) {
+                if (java.security.MessageDigest.isEqual(
+                        expectedSig, receivedSig.getBytes(java.nio.charset.StandardCharsets.UTF_8))) {
+                    matched = true;
+                }
+            }
+            return matched;
         } catch (Exception e) {
             return false;
         }

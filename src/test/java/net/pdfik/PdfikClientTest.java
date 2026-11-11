@@ -966,8 +966,104 @@ public class PdfikClientTest {
         }
         assertTrue(cause instanceof PdfikException);
         assertEquals(503, ((PdfikException) cause).getStatusCode());
+        assertEquals("NETWORK_ERROR", ((PdfikException) cause).getErrorCode());
         assertEquals(List.of(2000L, 1000L, 2000L), waits);
         wireMockServer.verify(4, postRequestedFor(urlEqualTo("/html-to-pdf")));
+    }
+
+    // A connection failure is PdfikException 503 with the code NETWORK_ERROR, as in the
+    // other PDFik SDKs, and the ordinary calls resend it like a 5xx: three attempts,
+    // one Idempotency-Key.
+    @Test
+    public void testBrokenConnectionIsANetworkErrorResentLikeA5xx() {
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-pdf")).willReturn(aResponse().withFault(Fault.EMPTY_RESPONSE)));
+        List<Long> waits = recordWaits();
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> client.urlToPdf("https://example.com"));
+
+        assertEquals(503, exception.getStatusCode());
+        assertEquals("NETWORK_ERROR", exception.getErrorCode());
+        assertTrue(exception.getMessage().startsWith("Connection failed: "), exception.getMessage());
+        assertTrue(exception.getCause() instanceof java.io.IOException, String.valueOf(exception.getCause()));
+        assertEquals(List.of(1000L, 2000L), waits);
+        assertOneGeneratedKey(idempotencyKeys(postRequestedFor(urlEqualTo("/url-to-pdf"))), 3);
+    }
+
+    // A refused connection, through the real JDK client: the JDK's exception is the cause.
+    // (On Java 17+ the JDK gives no message at all here, which used to read
+    // "Connection failed: null"; the test run's Java 11 still names it.)
+    @Test
+    public void testRefusedConnectionIsANetworkErrorThatKeepsItsCause() throws Exception {
+        int port;
+        try (java.net.ServerSocket socket = new java.net.ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"))) {
+            port = socket.getLocalPort();
+        }
+        try (PdfikClient refused = PdfikClient.builder()
+                .apiKey("sk_test_123")
+                .baseUrl("http://127.0.0.1:" + port)
+                .connectTimeout(Duration.ofSeconds(1))
+                .requestTimeout(Duration.ofSeconds(2))
+                .build()) {
+            List<Long> waits = new CopyOnWriteArrayList<>();
+            refused.sleeper = millis -> waits.add(millis);
+
+            PdfikException exception = assertThrows(PdfikException.class, () -> refused.getJob("job-1"));
+
+            assertEquals(503, exception.getStatusCode());
+            assertEquals("NETWORK_ERROR", exception.getErrorCode());
+            assertFalse(exception.getMessage().endsWith("null"), exception.getMessage());
+            assertTrue(exception.getCause() instanceof java.net.ConnectException, String.valueOf(exception.getCause()));
+            assertEquals(List.of(1000L, 2000L), waits);
+        }
+    }
+
+    // java.net.http throws with no message at any level for a host that cannot be
+    // resolved (every JDK) and for a refused connection (Java 17+): the message still
+    // names the failure, and the JDK's exception is the cause.
+    @Test
+    public void testNetworkErrorWithoutAnyJdkMessageIsStillDescribedAndKeepsTheCause() {
+        java.net.ConnectException unresolved = new java.net.ConnectException();
+        java.net.ConnectException inner = new java.net.ConnectException();
+        inner.initCause(new java.nio.channels.UnresolvedAddressException());
+        unresolved.initCause(inner);
+        PdfikException dns = PdfikClient.networkError(unresolved);
+        assertEquals("Connection failed: host could not be resolved", dns.getMessage());
+        assertSame(unresolved, dns.getCause());
+        assertEquals(503, dns.getStatusCode());
+        assertEquals("NETWORK_ERROR", dns.getErrorCode());
+
+        java.net.ConnectException refused = new java.net.ConnectException();
+        refused.initCause(new java.nio.channels.ClosedChannelException());
+        PdfikException connect = PdfikClient.networkError(refused);
+        assertEquals("Connection failed: java.net.ConnectException", connect.getMessage());
+        assertSame(refused, connect.getCause());
+
+        // The first message down the chain, when the outer levels carry none.
+        java.io.IOException wrapped = new java.io.IOException(null, new java.io.IOException("Connection reset"));
+        assertEquals("Connection failed: Connection reset", PdfikClient.networkError(wrapped).getMessage());
+
+        // A cyclic chain (legal, if odd) ends the walk instead of looping forever.
+        java.io.IOException first = new java.io.IOException((String) null);
+        java.io.IOException second = new java.io.IOException((String) null);
+        first.initCause(second);
+        second.initCause(first);
+        assertEquals("Connection failed: java.io.IOException", PdfikClient.networkError(first).getMessage());
+    }
+
+    // The same when the status line arrived but the body broke off: send() reads the
+    // body before it returns, so the failure is the same IOException.
+    @Test
+    public void testDownloadWhoseBodyBreaksOffIsANetworkErrorAndNotResent() {
+        wireMockServer.stubFor(get(urlEqualTo("/jobs/job-cut/download")).willReturn(aResponse().withFault(Fault.MALFORMED_RESPONSE_CHUNK)));
+        List<Long> waits = recordWaits();
+
+        PdfikException exception = assertThrows(PdfikException.class, () -> client.downloadPdf("job-cut"));
+
+        assertEquals(503, exception.getStatusCode());
+        assertEquals("NETWORK_ERROR", exception.getErrorCode());
+        // Not resent: every started stream is one of the file's three download attempts.
+        assertEquals(List.of(), waits);
+        wireMockServer.verify(1, getRequestedFor(urlEqualTo("/jobs/job-cut/download")));
     }
 
     @Test
@@ -1307,6 +1403,7 @@ public class PdfikClientTest {
         PdfikException exception = assertThrows(PdfikException.class, () -> client.htmlToImageFile("<h1>Hi</h1>"));
 
         assertEquals(503, exception.getStatusCode());
+        assertEquals("NETWORK_ERROR", exception.getErrorCode());
         assertTrue(waits.isEmpty());
         wireMockServer.verify(1, postRequestedFor(urlEqualTo("/html-to-image")));
     }
@@ -1376,6 +1473,7 @@ public class PdfikClientTest {
 
         assertTrue(failure.getCause() instanceof PdfikException);
         assertEquals(503, ((PdfikException) failure.getCause()).getStatusCode());
+        assertEquals("NETWORK_ERROR", ((PdfikException) failure.getCause()).getErrorCode());
         assertTrue(waits.isEmpty());
         wireMockServer.verify(1, postRequestedFor(urlEqualTo("/markdown-to-pdf")));
     }
@@ -1429,35 +1527,5 @@ public class PdfikClientTest {
         wireMockServer.verify(0, postRequestedFor(anyUrl()));
     }
 
-    @Test
-    public void testVerifyWebhookSignature() throws Exception {
-        String rawBody = "{\"job_id\":\"123\",\"event_type\":\"job.completed\"}";
-        String timestamp = String.valueOf(System.currentTimeMillis() / 1000);
-        String secret = "whsec_testsecret";
-
-        String signedPayload = timestamp + "." + rawBody;
-        javax.crypto.Mac mac = javax.crypto.Mac.getInstance("HmacSHA256");
-        javax.crypto.spec.SecretKeySpec secretKey = new javax.crypto.spec.SecretKeySpec(
-                secret.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                "HmacSHA256"
-        );
-        mac.init(secretKey);
-        byte[] rawHmac = mac.doFinal(signedPayload.getBytes(java.nio.charset.StandardCharsets.UTF_8));
-        
-        StringBuilder hexString = new StringBuilder();
-        for (byte b : rawHmac) {
-            String hex = Integer.toHexString(0xff & b);
-            if (hex.length() == 1) hexString.append('0');
-            hexString.append(hex);
-        }
-        String signature = hexString.toString();
-
-        java.util.Map<String, String> headers = new java.util.HashMap<>();
-        headers.put("X-PDFik-Signature", "t=" + timestamp + ",v1=" + signature);
-        headers.put("X-PDFik-Timestamp", timestamp);
-
-        assertTrue(PdfikClient.verifyWebhookSignature(rawBody, headers, secret));
-        assertFalse(PdfikClient.verifyWebhookSignature(rawBody, headers, "wrong_secret"));
-        assertFalse(PdfikClient.verifyWebhookSignature(rawBody, new java.util.HashMap<>(), secret));
-    }
+    // verifyWebhookSignature is covered by WebhookSignatureTest (no HTTP, so no WireMock).
 }

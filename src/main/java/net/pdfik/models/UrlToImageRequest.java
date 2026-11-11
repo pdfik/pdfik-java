@@ -8,7 +8,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
  * endpoints; the download returns the raw {@code image/png} or
  * {@code image/jpeg} bytes (filename {@code {jobId}.png}/{@code .jpg}).
  *
- * <p>{@code auth} (Pro+) attaches basic/bearer credentials exactly as on
+ * <p>{@code auth} attaches basic/bearer credentials exactly as on
  * {@code urlToPdf}. {@code delivery} uploads the output straight to
  * your own bucket via a presigned PUT URL; {@code test} runs the full
  * pipeline without real rendering. The two cannot be combined.</p>
