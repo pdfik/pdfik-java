@@ -1528,4 +1528,80 @@ public class PdfikClientTest {
     }
 
     // verifyWebhookSignature is covered by WebhookSignatureTest (no HTTP, so no WireMock).
+
+    // --- integrations release (0.6.0): GET /account and X-PDFik-Client -------------------
+
+    private static final String ACCOUNT_BODY = "{\"plan\":\"pro\","
+            + "\"window\":{\"start\":\"2026-11-05T00:00:00Z\",\"end\":\"2026-12-05T00:00:00Z\"},"
+            + "\"usage\":{\"documents\":1234,\"bytes\":52428800},"
+            + "\"limits\":{\"documents\":50000,\"bytes\":53687091200,\"requests_per_minute\":500,"
+            + "\"concurrent_jobs\":50,\"max_file_size_bytes\":157286400},"
+            + "\"test_mode\":{\"per_minute\":60,\"per_day\":2000},"
+            + "\"key\":{\"name\":null}}";
+
+    @Test
+    public void versionMatchesThePomAndNamesTheClientHeader() throws Exception {
+        String pom = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get("pom.xml")), java.nio.charset.StandardCharsets.UTF_8);
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("<artifactId>pdfik-client</artifactId>\\s*<version>([^<]+)</version>").matcher(pom);
+        assertTrue(m.find());
+        assertEquals(m.group(1), PdfikClient.VERSION);
+        assertEquals("sdk-java/" + m.group(1), PdfikClient.CLIENT_HEADER);
+    }
+
+    private void assertAccount(AccountResponse account) {
+        assertEquals("pro", account.getPlan());
+        assertEquals("2026-12-05T00:00:00Z", account.getWindow().getEnd());
+        assertEquals(1234L, account.getUsage().getDocuments());
+        assertEquals(53687091200L, account.getLimits().getBytes());
+        assertEquals(500, account.getLimits().getRequestsPerMinute());
+        assertEquals(157286400L, account.getLimits().getMaxFileSizeBytes());
+        assertEquals(2000, account.getTestMode().getPerDay());
+        assertNull(account.getKey().getName());
+    }
+
+    @Test
+    public void getAccountReadsAccountAndSendsTheClientHeader() {
+        wireMockServer.stubFor(get(urlEqualTo("/account"))
+                .willReturn(aResponse().withStatus(200).withHeader("Content-Type", "application/json").withBody(ACCOUNT_BODY)));
+
+        assertAccount(client.getAccount());
+
+        wireMockServer.verify(1, getRequestedFor(urlEqualTo("/account"))
+                .withHeader("X-API-Key", equalTo("sk_test_123"))
+                .withHeader("X-PDFik-Client", equalTo(PdfikClient.CLIENT_HEADER))
+                .withoutHeader("Idempotency-Key"));
+    }
+
+    @Test
+    public void getAccountAsyncReadsTheSameAccount() throws Exception {
+        wireMockServer.stubFor(get(urlEqualTo("/account"))
+                .willReturn(aResponse().withStatus(200).withHeader("Content-Type", "application/json").withBody(ACCOUNT_BODY)));
+
+        assertAccount(client.getAccountAsync().get());
+
+        wireMockServer.verify(1, getRequestedFor(urlEqualTo("/account"))
+                .withHeader("X-PDFik-Client", equalTo(PdfikClient.CLIENT_HEADER)));
+    }
+
+    @Test
+    public void getAccountRaisesForARejectedKey() {
+        wireMockServer.stubFor(get(urlEqualTo("/account"))
+                .willReturn(aResponse().withStatus(401).withHeader("Content-Type", "application/json")
+                        .withBody("{\"type\":\"https://docs.pdfik.net/error-codes#401\",\"title\":\"Invalid API key\",\"status\":401,\"detail\":\"Invalid API key\"}")));
+
+        PdfikException e = assertThrows(PdfikException.class, () -> client.getAccount());
+        assertEquals(401, e.getStatusCode());
+    }
+
+    @Test
+    public void jobCreationNamesTheSdkToo() {
+        wireMockServer.stubFor(post(urlEqualTo("/url-to-pdf"))
+                .willReturn(aResponse().withStatus(202).withHeader("Content-Type", "application/json").withBody(JOB_QUEUED)));
+
+        client.urlToPdf("https://example.com");
+
+        wireMockServer.verify(postRequestedFor(urlEqualTo("/url-to-pdf"))
+                .withHeader("X-PDFik-Client", equalTo(PdfikClient.CLIENT_HEADER)));
+    }
 }

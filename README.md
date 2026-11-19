@@ -1,6 +1,6 @@
 # pdfik-client
 
-> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-11-11).
+> **Where this code lives:** extracted from the PDFik platform monorepo (last sync 2026-11-19).
 > Releases to Maven Central are cut from the monorepo; issues and PRs are welcome here.
 
 Official Java SDK for [PDFik](https://pdfik.net) — the URL/HTML-to-PDF API.
@@ -26,7 +26,7 @@ Add the following dependency to your `pom.xml`:
 <dependency>
   <groupId>net.pdfik</groupId>
   <artifactId>pdfik-client</artifactId>
-  <version>0.5.0</version>
+  <version>0.6.0</version>
 </dependency>
 ```
 
@@ -35,7 +35,7 @@ Add the following dependency to your `pom.xml`:
 Add the following to your `build.gradle`:
 
 ```groovy
-implementation 'net.pdfik:pdfik-client:0.5.0'
+implementation 'net.pdfik:pdfik-client:0.6.0'
 ```
 
 ## Quick Start
@@ -166,6 +166,17 @@ Get the direct API download URL for the generated PDF (requires the "X-API-Key" 
 ```java
 JobFileResponse fileInfo = client.getFileUrl(job.getJobId());
 System.out.println("Direct Download URL: " + fileInfo.getDownloadUrl());
+```
+
+### Check your key and usage
+
+`getAccount()` (or `getAccountAsync()`) returns the plan, the current quota window, what has been used in it and the limits — without creating a job or charging anything:
+
+```java
+AccountResponse account = client.getAccount();
+System.out.println(account.getPlan());                                              // e.g. "free"
+System.out.println(account.getUsage().getDocuments() + " of " + account.getLimits().getDocuments()); // used / allowed this window
+System.out.println(account.getWindow().getEnd());                                   // when the window resets
 ```
 
 ### Test mode

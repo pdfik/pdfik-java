@@ -20,6 +20,11 @@ import java.util.concurrent.*;
 import java.util.function.Supplier;
 
 public class PdfikClient implements AutoCloseable {
+    // Package-private: this SDK's version (a test pins it to the pom) and the
+    // X-PDFik-Client value of every request it sends.
+    static final String VERSION = "0.6.0";
+    static final String CLIENT_HEADER = "sdk-java/" + VERSION;
+
     // A throttle (rate or in-flight limit) is waited out, not counted as a failed
     // attempt — but not forever: after this many waits the 429 is raised.
     static final int THROTTLE_WAITS = 5;
@@ -474,6 +479,7 @@ public class PdfikClient implements AutoCloseable {
                         .uri(URI.create(baseUrl + path))
                         .timeout(requestTimeout)
                         .header("X-API-Key", apiKey)
+                        .header("X-PDFik-Client", CLIENT_HEADER)
                         .header("Content-Type", "application/json")
                         .header("Idempotency-Key", key)
                         .POST(HttpRequest.BodyPublishers.ofString(json))
@@ -506,6 +512,7 @@ public class PdfikClient implements AutoCloseable {
                 .uri(URI.create(baseUrl + path))
                 .timeout(timeout)
                 .header("X-API-Key", apiKey)
+                .header("X-PDFik-Client", CLIENT_HEADER)
                 .header("Content-Type", "application/json")
                 .header("Idempotency-Key", key)
                 .POST(HttpRequest.BodyPublishers.ofString(json))
@@ -561,6 +568,7 @@ public class PdfikClient implements AutoCloseable {
                 .uri(URI.create(baseUrl + path))
                 .timeout(requestTimeout)
                 .header("X-API-Key", apiKey)
+                .header("X-PDFik-Client", CLIENT_HEADER)
                 .GET()
                 .build();
     }
@@ -886,6 +894,20 @@ public class PdfikClient implements AutoCloseable {
         checkResponse(response);
         try {
             return objectMapper.readValue(response.body(), JobCreatedResponse.class);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse response body", e);
+        }
+    }
+
+    /**
+     * The key's account: plan, current quota window, usage in it and limits. Creates no
+     * job and charges nothing — useful to check that a key works.
+     */
+    public AccountResponse getAccount() {
+        HttpResponse<String> response = executeWithRetry(createGetRequest("/account"), HttpResponse.BodyHandlers.ofString(), THROTTLE_WAITS, THROTTLES);
+        checkResponse(response);
+        try {
+            return objectMapper.readValue(response.body(), AccountResponse.class);
         } catch (Exception e) {
             throw new RuntimeException("Failed to parse response body", e);
         }
@@ -1417,6 +1439,19 @@ public class PdfikClient implements AutoCloseable {
                     checkResponse(response);
                     try {
                         return objectMapper.readValue(response.body(), JobCreatedResponse.class);
+                    } catch (Exception e) {
+                        throw new CompletionException("Failed to parse response body", e);
+                    }
+                });
+    }
+
+    /** {@link #getAccount()}, asynchronously. */
+    public CompletableFuture<AccountResponse> getAccountAsync() {
+        return executeWithRetryAsync(createGetRequest("/account"), HttpResponse.BodyHandlers.ofString(), 1, THROTTLE_WAITS, THROTTLES)
+                .thenApply(response -> {
+                    checkResponse(response);
+                    try {
+                        return objectMapper.readValue(response.body(), AccountResponse.class);
                     } catch (Exception e) {
                         throw new CompletionException("Failed to parse response body", e);
                     }

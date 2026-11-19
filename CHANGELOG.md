@@ -4,6 +4,15 @@ All notable changes to `net.pdfik:pdfik-client` are documented here. The format 
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] — 2026-11-19
+
+### Added
+- `getAccount()` / `getAccountAsync()` — `GET /account`: the key's plan, current quota
+  window, usage in it and limits (`AccountResponse`). Creates no job and charges nothing;
+  useful to check a key.
+- Every request sends `X-PDFik-Client: sdk-java/<version>` so usage can be attributed to
+  this SDK.
+
 ## [0.5.0] — 2026-11-09
 
 ### Fixed (also in 0.5.0, before its first publication)
